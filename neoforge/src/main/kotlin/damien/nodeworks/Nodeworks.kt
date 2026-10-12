@@ -58,7 +58,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         // Initialize platform services BEFORE any registration
         PlatformServices.blockEntity = NeoForgeBlockEntityService()
         PlatformServices.menu = NeoForgeMenuService()
-        PlatformServices.storage = NeoForgeStorageService()
+        PlatformServices.storage = damien.nodeworks.platform.CompositeStorageService(NeoForgeStorageService())
         PlatformServices.modState = NeoForgeModStateService()
         PlatformServices.fakePlayer = damien.nodeworks.platform.NeoForgeFakePlayerService()
         PlatformServices.serverNetworking = NeoForgeServerNetworkingService()
@@ -402,6 +402,15 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                         menu.handleGridClick(player, payload.itemId, payload.action, payload.componentsPatch)
                     }
                 }
+            }
+        }
+        registrar.playToServer(
+            damien.nodeworks.network.OpenPortableTerminalPayload.TYPE,
+            damien.nodeworks.network.OpenPortableTerminalPayload.CODEC,
+        ) { _, context ->
+            context.enqueueWork {
+                val player = context.player() as? net.minecraft.server.level.ServerPlayer ?: return@enqueueWork
+                damien.nodeworks.item.PortableTerminalOpener.openFromInventory(player)
             }
         }
         registrar.playToServer(InvTerminalSlotClickPayload.TYPE, InvTerminalSlotClickPayload.CODEC) { payload, context ->

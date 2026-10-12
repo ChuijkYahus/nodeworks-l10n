@@ -107,6 +107,9 @@ class InventoryTerminalMenu(
 
     // Crafting grid
     var autoPull: Boolean = false
+    // Template of the stack the last shift-click moved into the network. A shift
+    // double-click sweeps everything matching it, the clicked slot is already empty.
+    private var lastShiftInserted: ItemStack = ItemStack.EMPTY
     private var autoPullPattern: List<String>? = null  // captured right before craft output is taken
     private var suppressSlotsChanged = false
     private var pendingAutoPull = false  // deferred to next tick to avoid MC packet reconciliation conflicts
@@ -898,6 +901,8 @@ class InventoryTerminalMenu(
                 }
             }
             2 -> { // Shift-click, crystal → crystal slot (Handheld), else network
+                // Reset so a shift double-click on an empty slot sweeps nothing.
+                lastShiftInserted = ItemStack.EMPTY
                 val slotStack = playerInventory.getItem(invIndex)
                 if (!slotStack.isEmpty) {
                     val cContainer = crystalContainer
@@ -916,6 +921,7 @@ class InventoryTerminalMenu(
                         val lvl = serverLevel
                         val snap = snapshot
                         if (lvl != null && snap != null) {
+                            lastShiftInserted = slotStack.copyWithCount(1)
                             val inserted = NetworkStorageHelper.insertItemStack(lvl, snap, slotStack, cache)
                             if (inserted > 0) {
                                 slotStack.shrink(inserted)
@@ -925,12 +931,31 @@ class InventoryTerminalMenu(
                     }
                 }
             }
+            3 -> { // Shift double-click, move every stack matching the last shift-inserted item
+                val template = lastShiftInserted
+                val lvl = serverLevel
+                val snap = snapshot
+                if (!template.isEmpty && lvl != null && snap != null) {
+                    for (i in 0 until 36) {
+                        if (isHeldPortableInvSlot(i)) continue
+                        val stack = playerInventory.getItem(i)
+                        if (stack.isEmpty || !ItemStack.isSameItemSameComponents(stack, template)) continue
+                        val inserted = NetworkStorageHelper.insertItemStack(lvl, snap, stack, cache)
+                        if (inserted > 0) {
+                            stack.shrink(inserted)
+                            if (stack.isEmpty) playerInventory.setItem(i, ItemStack.EMPTY)
+                        }
+                        // Network stopped accepting, the rest would be refused too.
+                        if (!stack.isEmpty) break
+                    }
+                }
+            }
         }
 
         // Mark inventory dirty so the player's inventoryMenu syncs the change
         playerInventory.setChanged()
         // Force immediate network inventory sync if we inserted into network
-        if (action == 2) needsImmediateSync = true
+        if (action == 2 || action == 3) needsImmediateSync = true
     }
 
     /** Fill the crafting grid from a JEI recipe transfer. The server
@@ -1217,6 +1242,23 @@ class InventoryTerminalMenu(
         needsImmediateSync = true
     }
 
+    /** Whether a distribute drag may place into [slotIndex]: empty, or the same item
+     *  with room. Matches the client gate so a slot holding something else neither
+     *  receives items nor shrinks the share of the others. */
+    private fun canDistributeInto(slotType: Int, slotIndex: Int, carried: ItemStack): Boolean {
+        val existing = when (slotType) {
+            0 -> if (slotIndex in CRAFT_INPUT_START until CRAFT_OUTPUT_SLOT) slots[slotIndex].item else return false
+            1 -> {
+                if (slotIndex < 0 || slotIndex >= 36) return false
+                val invIndex = if (slotIndex < 27) slotIndex + 9 else slotIndex - 27
+                if (isHeldPortableInvSlot(invIndex)) return false
+                playerInventory.getItem(invIndex)
+            }
+            else -> return false
+        }
+        return existing.isEmpty || (ItemStack.isSameItemSameComponents(existing, carried) && existing.count < existing.maxStackSize)
+    }
+
     /**
      * Distribute the carried item evenly across the specified crafting slot indices.
      * Used for left-click drag.
@@ -1230,14 +1272,16 @@ class InventoryTerminalMenu(
         val carried = carried
         if (carried.isEmpty || slotIndices.isEmpty()) return
 
+        val targets = slotIndices.filter { canDistributeInto(slotType, it, carried) }
+        if (targets.isEmpty()) return
         val total = carried.count
-        val count = slotIndices.size
+        val count = targets.size
         val perSlot = total / count
         val remainder = total % count
         if (perSlot <= 0 && remainder <= 0) return
 
         var distributed = 0
-        for ((idx, slotIndex) in slotIndices.withIndex()) {
+        for ((idx, slotIndex) in targets.withIndex()) {
             val amount = perSlot + if (idx < remainder) 1 else 0
             if (amount <= 0) continue
 

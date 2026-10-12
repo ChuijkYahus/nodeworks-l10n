@@ -83,6 +83,12 @@ repositories {
         name = "Central Snapshots"
         url = uri("https://central.sonatype.com/repository/maven-snapshots/")
     }
+    // AE2 ships on the Modrinth maven. Scoped so Gradle never probes it for other groups.
+    maven {
+        name = "Modrinth"
+        url = uri("https://api.modrinth.com/maven")
+        content { includeGroup("maven.modrinth") }
+    }
 }
 
 // Optional dependency only the `runGuideExport` task needs at runtime, the
@@ -121,6 +127,10 @@ dependencies {
 
     // Dev-only testing mods (not bundled in release)
     runtimeOnly("mezz.jei:jei-${providers.gradleProperty("minecraft_version").get()}-neoforge:${providers.gradleProperty("jei_version").get()}")
+
+    // Applied Energistics 2, optional ME Interface storage bridge. Compile-time only so
+    // the bridge builds against the real API. Not loaded in dev runs or bundled in the jar.
+    compileOnly("maven.modrinth:ae2:${providers.gradleProperty("ae2_version").get()}")
 }
 
 // Copy common resources + guidebook content alongside neoforge resources
