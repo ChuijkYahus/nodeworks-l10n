@@ -41,16 +41,9 @@ class NeoForgeStorageService : StorageService {
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
             if (!filter(itemId)) continue
 
-            val toMove = minOf(remaining, stack.count.toLong()).toInt()
-            val extracted = src.extractItem(slot, toMove, true) // simulate
-            if (extracted.isEmpty) continue
-
-            val inserted = insertInto(dest, extracted, simulate = false)
-            if (inserted > 0) {
-                src.extractItem(slot, inserted, false) // actually extract
-                total += inserted
-                remaining -= inserted
-            }
+            val moved = moveFromSlot(src, slot, dest, remaining)
+            total += moved
+            remaining -= moved
         }
         return total
     }
@@ -69,16 +62,9 @@ class NeoForgeStorageService : StorageService {
             val hasData = stack.componentsPatch.size() > 0
             if (!filter(itemId, hasData)) continue
 
-            val toMove = minOf(remaining, stack.count.toLong()).toInt()
-            val extracted = src.extractItem(slot, toMove, true)
-            if (extracted.isEmpty) continue
-
-            val inserted = insertInto(dest, extracted, simulate = false)
-            if (inserted > 0) {
-                src.extractItem(slot, inserted, false)
-                total += inserted
-                remaining -= inserted
-            }
+            val moved = moveFromSlot(src, slot, dest, remaining)
+            total += moved
+            remaining -= moved
         }
         return total
     }
@@ -102,18 +88,55 @@ class NeoForgeStorageService : StorageService {
             // Predicate sees the full slot stack for component-aware matching.
             if (!filter(stack)) continue
 
-            val toMove = minOf(remaining, stack.count.toLong()).toInt()
-            val extracted = src.extractItem(slot, toMove, true) // simulate
-            if (extracted.isEmpty) continue
-
-            val inserted = insertInto(dest, extracted, simulate = false)
-            if (inserted > 0) {
-                src.extractItem(slot, inserted, false) // actually extract
-                total += inserted
-                remaining -= inserted
-            }
+            val moved = moveFromSlot(src, slot, dest, remaining)
+            total += moved
+            remaining -= moved
         }
         return total
+    }
+
+    /** Take up to [amount] from [slot], asking until it is met or the slot is empty. A
+     *  handler returns at most one stack per call, so slots holding more (drawers) need
+     *  repeated asks. Stops if the slot starts holding a different item. */
+    private inline fun drainSlot(handler: IItemHandler, slot: Int, amount: Long, take: (ItemStack) -> Unit): Long {
+        var got = 0L
+        var first: ItemStack? = null
+        while (got < amount) {
+            val ask = minOf(amount - got, Int.MAX_VALUE.toLong()).toInt()
+            if (first != null && !ItemStack.isSameItemSameComponents(handler.extractItem(slot, ask, true), first)) break
+            val extracted = handler.extractItem(slot, ask, false)
+            if (extracted.isEmpty) break
+            if (first == null) first = extracted.copyWithCount(1)
+            take(extracted)
+            got += extracted.count
+            // Less than asked and less than a stack means the slot ran out, skip asking again.
+            if (extracted.count < minOf(ask, extracted.maxStackSize)) break
+        }
+        return got
+    }
+
+    /** Move up to [amount] from one source slot into [dest], one stack per round, until
+     *  it is met, the slot runs dry, dest refuses, or the [MoveDeadline] passes. */
+    private fun moveFromSlot(src: IItemHandler, slot: Int, dest: NeoForgeItemStorageHandle, amount: Long): Long {
+        var moved = 0L
+        var first: ItemStack? = null
+        while (moved < amount) {
+            if (moved > 0L && MoveDeadline.expired()) break
+            val offered = src.extractItem(slot, minOf(amount - moved, Int.MAX_VALUE.toLong()).toInt(), true)
+            if (offered.isEmpty) break
+            // Same guard as [drainSlot].
+            if (first != null && !ItemStack.isSameItemSameComponents(offered, first)) break
+            if (first == null) first = offered.copyWithCount(1)
+            val inserted = insertInto(dest, offered, simulate = false)
+            if (inserted <= 0) break
+            val taken = src.extractItem(slot, inserted, false).count
+            moved += inserted
+            // A source giving back less than it offered would duplicate, never repeat that.
+            if (taken < inserted || inserted < offered.count) break
+            // Less than a stack means the slot ran out or the request is met.
+            if (offered.count < offered.maxStackSize) break
+        }
+        return moved
     }
 
     override fun countItems(storage: ItemStorageHandle, filter: (String) -> Boolean): Long {
@@ -140,10 +163,9 @@ class NeoForgeStorageService : StorageService {
             if (stack.isEmpty) continue
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
             if (!filter(itemId)) continue
-            val toExtract = minOf(remaining, stack.count.toLong()).toInt()
-            val extracted = handler.extractItem(slot, toExtract, false)
-            total += extracted.count
-            remaining -= extracted.count
+            val got = drainSlot(handler, slot, remaining) {}
+            total += got
+            remaining -= got
         }
         return total
     }
@@ -163,14 +185,10 @@ class NeoForgeStorageService : StorageService {
             if (stack.isEmpty) continue
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
             if (!filter(itemId)) continue
-            val toExtract = minOf(remaining, stack.count.toLong()).toInt()
             // extractItem returns a real stack with the slot's components intact,
             // unlike extractItems which only sums counts. Returning these directly
             // preserves durability, enchantments, custom names, dye colour, etc.
-            val extracted = handler.extractItem(slot, toExtract, false)
-            if (extracted.isEmpty) continue
-            out.add(extracted)
-            remaining -= extracted.count
+            remaining -= drainSlot(handler, slot, remaining) { out.add(it) }
         }
         return out
     }
@@ -192,11 +210,7 @@ class NeoForgeStorageService : StorageService {
             // component-bearing identity (e.g. only Strength Potions, not
             // every variant of `minecraft:potion`).
             if (!filter(stack)) continue
-            val toExtract = minOf(remaining, stack.count.toLong()).toInt()
-            val extracted = handler.extractItem(slot, toExtract, false)
-            if (extracted.isEmpty) continue
-            out.add(extracted)
-            remaining -= extracted.count
+            remaining -= drainSlot(handler, slot, remaining) { out.add(it) }
         }
         return out
     }
@@ -425,9 +439,7 @@ class NeoForgeStorageService : StorageService {
             if (remaining <= 0) break
             val s = handler.getStackInSlot(slot)
             if (s.isEmpty || s.item != item) continue
-            val take = minOf(remaining, s.count)
-            val e = handler.extractItem(slot, take, false)
-            remaining -= e.count
+            remaining -= drainSlot(handler, slot, remaining.toLong()) {}.toInt()
         }
     }
 

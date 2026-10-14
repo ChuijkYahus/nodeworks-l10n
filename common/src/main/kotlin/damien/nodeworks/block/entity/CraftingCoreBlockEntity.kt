@@ -392,6 +392,13 @@ class CraftingCoreBlockEntity(
         return true
     }
 
+    /** Add a crafting result to [itemId]'s plain bucket, keeping [stack]'s components. */
+    fun addCraftedToBuffer(itemId: String, stack: net.minecraft.world.item.ItemStack, count: Long): Boolean {
+        if (!bufferState.insertCrafted(itemId, stack, count)) return false
+        setChanged()
+        return true
+    }
+
     /**
      * Remove up to [count] of [itemId] from the buffer.
      * Returns the amount actually removed (≤ count, 0 if nothing to remove).
