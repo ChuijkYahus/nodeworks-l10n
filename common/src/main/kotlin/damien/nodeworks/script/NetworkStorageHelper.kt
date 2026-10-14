@@ -254,6 +254,7 @@ object NetworkStorageHelper {
             if (!channel.matches(card.channel)) continue
             val storage = getFluidStorage(level, card) ?: continue
             val inserted = PlatformServices.storage.insertFluid(storage, fluidId, remaining)
+            if (inserted > 0L) cache?.onChannelFluidDelta(card.channel, fluidId, inserted)
             remaining -= inserted
         }
         val placed = amount - remaining
@@ -287,6 +288,7 @@ object NetworkStorageHelper {
         routeTable: RouteTable? = null,
         cache: NetworkInventoryCache? = null,
         channel: ChannelFilter = ChannelFilter.All,
+        onFail: ((reason: String, msg: String) -> Unit)? = null,
     ): Boolean {
         if (requested <= 0L) return true
 
@@ -303,7 +305,10 @@ object NetworkStorageHelper {
                 remainingDemand -= take
             }
         }
-        if (remainingDemand > 0L) return false
+        if (remainingDemand > 0L) {
+            onFail?.invoke("source", "network:insert moved nothing: only ${requested - remainingDemand} of the $requested items are in the source.")
+            return false
+        }
 
         // Capacity probe, per item type. Each type checks independently against the full
         // network, a storage card's free slots are consumed by the first type we probe,
@@ -323,7 +328,10 @@ object NetworkStorageHelper {
                     PlatformServices.storage.simulateInsertItem(dest, item, need - capacity)
                 } catch (_: Exception) { 0L }
             }
-            if (capacity < need) return false
+            if (capacity < need) {
+                onFail?.invoke("space", "network:insert moved nothing: not enough space for $itemId, only $capacity of $need fit.")
+                return false
+            }
         }
 
         // Sim said it fits, commit. Under single-threaded server execution this should
@@ -333,6 +341,7 @@ object NetworkStorageHelper {
         // source. This keeps the atomic contract even on pathological edge cases.
         val moved = insertItems(level, snapshot, source, filter, requested, routeTable, null, cache, channel)
         if (moved == requested) return true
+        onFail?.invoke("refused", "network:insert moved nothing: the network refused some of the items.")
 
         // Unexpected shortfall, unwind. Since source was just drained of at most `moved`
         // items of types we tracked in `demand`, it necessarily has slot capacity for them
@@ -569,6 +578,7 @@ object NetworkStorageHelper {
             if (cap != null && !cap.acceptsItem(stack, registries)) continue
             val storage = getStorage(level, card) ?: continue
             val inserted = PlatformServices.storage.insertItemStack(storage, stack.copyWithCount(remaining))
+            if (inserted > 0 && itemId != null) cache?.onChannelDelta(card.channel, itemId, stack.componentsPatch, inserted.toLong())
             remaining -= inserted
         }
         val totalInserted = stack.count - remaining

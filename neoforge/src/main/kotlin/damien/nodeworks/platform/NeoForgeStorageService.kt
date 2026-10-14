@@ -10,6 +10,12 @@ import net.neoforged.neoforge.fluids.FluidStack
 import net.neoforged.neoforge.fluids.capability.IFluidHandler
 import net.neoforged.neoforge.items.IItemHandler
 import net.neoforged.neoforge.items.ItemHandlerHelper
+import net.neoforged.neoforge.transfer.ResourceHandler
+import net.neoforged.neoforge.transfer.ResourceHandlerUtil
+import net.neoforged.neoforge.transfer.item.ItemResource
+import net.neoforged.neoforge.transfer.resource.Resource
+import net.neoforged.neoforge.transfer.transaction.Transaction
+import net.neoforged.neoforge.transfer.transaction.TransactionContext
 
 class NeoForgeStorageService : StorageService {
 
@@ -19,7 +25,7 @@ class NeoForgeStorageService : StorageService {
         //  adapter is NeoForge's official migration ease path, keeps existing slot-based
         //  logic intact while consuming the new resource-handler capability.
         val resourceHandler = level.getCapability(Capabilities.Item.BLOCK, pos, face) ?: return null
-        return NeoForgeItemStorageHandle(IItemHandler.of(resourceHandler))
+        return NeoForgeItemStorageHandle(IItemHandler.of(resourceHandler), resourceHandler)
     }
 
     override fun moveItems(source: ItemStorageHandle, dest: ItemStorageHandle, filter: (String) -> Boolean, maxCount: Long): Long {
@@ -39,8 +45,7 @@ class NeoForgeStorageService : StorageService {
             val extracted = src.extractItem(slot, toMove, true) // simulate
             if (extracted.isEmpty) continue
 
-            val leftover = ItemHandlerHelper.insertItemStacked(dst, extracted.copy(), false)
-            val inserted = extracted.count - leftover.count
+            val inserted = insertInto(dest, extracted, simulate = false)
             if (inserted > 0) {
                 src.extractItem(slot, inserted, false) // actually extract
                 total += inserted
@@ -68,8 +73,7 @@ class NeoForgeStorageService : StorageService {
             val extracted = src.extractItem(slot, toMove, true)
             if (extracted.isEmpty) continue
 
-            val leftover = ItemHandlerHelper.insertItemStacked(dst, extracted.copy(), false)
-            val inserted = extracted.count - leftover.count
+            val inserted = insertInto(dest, extracted, simulate = false)
             if (inserted > 0) {
                 src.extractItem(slot, inserted, false)
                 total += inserted
@@ -102,8 +106,7 @@ class NeoForgeStorageService : StorageService {
             val extracted = src.extractItem(slot, toMove, true) // simulate
             if (extracted.isEmpty) continue
 
-            val leftover = ItemHandlerHelper.insertItemStacked(dst, extracted.copy(), false)
-            val inserted = extracted.count - leftover.count
+            val inserted = insertInto(dest, extracted, simulate = false)
             if (inserted > 0) {
                 src.extractItem(slot, inserted, false) // actually extract
                 total += inserted
@@ -212,45 +215,108 @@ class NeoForgeStorageService : StorageService {
         return total
     }
 
-    override fun insertItemStack(storage: ItemStorageHandle, stack: ItemStack): Int {
+    /** Insert [stack] into [handle], returning how many went in. A storage that routes
+     *  inserts itself (a storage controller, a drawer network) gets one whole-handler call
+     *  and picks the slot. Walking every slot per stack instead froze the server for minutes
+     *  on a controller with tens of thousands of slots. Plain inventories keep the stacking
+     *  walk so chests still top up existing stacks before empty slots. */
+    private fun insertInto(handle: NeoForgeItemStorageHandle, stack: ItemStack, simulate: Boolean): Int {
         if (stack.isEmpty) return 0
-        val handler = (storage as NeoForgeItemStorageHandle).handler
-        val leftover = ItemHandlerHelper.insertItemStacked(handler, stack.copy(), false)
+        val routed = handle.routed
+        if (routed != null && routesInsert(routed)) {
+            Transaction.openRoot().use { tx ->
+                val inserted = routed.insert(ItemResource.of(stack), stack.count, tx)
+                if (!simulate) tx.commit()
+                return inserted
+            }
+        }
+        val leftover = ItemHandlerHelper.insertItemStacked(handle.handler, stack.copy(), simulate)
         return stack.count - leftover.count
+    }
+
+    private val routesInsertByClass = java.util.concurrent.ConcurrentHashMap<Class<*>, Boolean>()
+
+    /** True when [handler] overrides the whole-handler insert. The interface default just
+     *  loops slots, so only an override means the storage has its own routing. */
+    private fun routesInsert(handler: ResourceHandler<*>): Boolean = routesInsertByClass.getOrPut(handler.javaClass) {
+        try {
+            handler.javaClass.getMethod(
+                "insert", Resource::class.java, Int::class.javaPrimitiveType, TransactionContext::class.java,
+            ).declaringClass != ResourceHandler::class.java
+        } catch (e: NoSuchMethodException) {
+            false
+        }
+    }
+
+    override fun insertItemStack(storage: ItemStorageHandle, stack: ItemStack): Int =
+        insertInto(storage as NeoForgeItemStorageHandle, stack, simulate = false)
+
+    /** What an extract of [maxCount] matching items would return, merged to one stack per
+     *  distinct item and components with the total as its count. Read-only. */
+    fun previewStacks(storage: ItemStorageHandle, filter: (ItemStack) -> Boolean, maxCount: Long): List<ItemStack> {
+        val handler = (storage as NeoForgeItemStorageHandle).handler
+        val merged = LinkedHashMap<ItemResource, ItemStack>()
+        var remaining = maxCount
+        for (slot in 0 until handler.slots) {
+            if (remaining <= 0L) break
+            val stack = handler.getStackInSlot(slot)
+            if (stack.isEmpty || !filter(stack)) continue
+            val take = minOf(remaining, stack.count.toLong()).toInt()
+            val key = ItemResource.of(stack)
+            val existing = merged[key]
+            if (existing == null) merged[key] = stack.copyWithCount(take) else existing.grow(take)
+            remaining -= take
+        }
+        return ArrayList(merged.values)
+    }
+
+    /** How many of [stacks] [dest] would accept, all simulated in one transaction that is
+     *  never committed, so each stack sees the space the earlier ones used. Null when
+     *  [dest] is a slot view with no handler to simulate against. */
+    fun simulateInsertStacks(dest: ItemStorageHandle, stacks: List<ItemStack>): Long? {
+        val routed = (dest as NeoForgeItemStorageHandle).routed ?: return null
+        val routes = routesInsert(routed)
+        var total = 0L
+        Transaction.openRoot().use { tx ->
+            for (stack in stacks) {
+                if (stack.isEmpty) continue
+                val resource = ItemResource.of(stack)
+                if (!routes) {
+                    total += ResourceHandlerUtil.insertStacking(routed, resource, stack.count, tx)
+                    continue
+                }
+                // Repeat until refused, a storage may fill only part of a merged stack per call.
+                var left = stack.count
+                while (left > 0) {
+                    val put = routed.insert(resource, left, tx)
+                    if (put <= 0) break
+                    total += put
+                    left -= put
+                }
+            }
+        }
+        return total
     }
 
     override fun simulateInsertItem(dest: ItemStorageHandle, item: net.minecraft.world.item.Item, maxCount: Long): Long {
         if (maxCount <= 0L) return 0L
-        val handler = (dest as NeoForgeItemStorageHandle).handler
         val capped = minOf(maxCount, Int.MAX_VALUE.toLong()).toInt()
-        val stack = ItemStack(item, capped)
-        // NeoForge's transactional simulate: `insertItemStacked(simulate=true)` opens a root
-        // transaction, snapshots each touched slot, performs the insertion on a copy, and aborts
-        // on close, net inventory state is guaranteed restored. Cosmetic slot reshuffling may
-        // be observed (the snapshot mechanism swaps the slot's ItemStack reference with a copy
-        // mid-transaction) but item counts are preserved by the transaction contract, so there
-        // is no duplication or loss risk.
-        val leftover = ItemHandlerHelper.insertItemStacked(handler, stack.copy(), true)
-        return (capped - leftover.count).toLong()
+        // Transactional simulate, aborted on close, so the storage is left untouched.
+        return insertInto(dest as NeoForgeItemStorageHandle, ItemStack(item, capped), simulate = true).toLong()
     }
 
     override fun tryInsertAll(dest: ItemStorageHandle, item: net.minecraft.world.item.Item, count: Long): Boolean {
         if (count <= 0L) return true
         if (count > Int.MAX_VALUE.toLong()) return false
-        val handler = (dest as NeoForgeItemStorageHandle).handler
+        val handle = dest as NeoForgeItemStorageHandle
         val stack = ItemStack(item, count.toInt())
-        // Simulate first, insertItemStacked with simulate=true returns leftover WITHOUT
-        // mutating the handler. On a single-threaded server, the subsequent real insert
-        // sees the same state the sim did, so a successful sim guarantees a successful commit.
-        val sim = ItemHandlerHelper.insertItemStacked(handler, stack.copy(), true)
-        if (!sim.isEmpty) return false
-        val real = ItemHandlerHelper.insertItemStacked(handler, stack.copy(), false)
-        if (!real.isEmpty) {
-            // Unexpected divergence between sim and real. Extract back exactly what we placed
-            // to keep the atomic contract, matches on item type which is unambiguous (the stack
-            // we passed in has no NBT components, so matches are straightforward).
-            val inserted = stack.count - real.count
-            extractByItem(handler, item, inserted)
+        // Simulate first. On a single-threaded server the real insert sees the same state,
+        // so a successful simulation guarantees the commit.
+        if (insertInto(handle, stack, simulate = true) < stack.count) return false
+        val inserted = insertInto(handle, stack, simulate = false)
+        if (inserted < stack.count) {
+            // Simulation and commit diverged. Take back what landed to keep the atomic contract.
+            extractByItem(handle.handler, item, inserted)
             return false
         }
         return true
@@ -322,15 +388,13 @@ class NeoForgeStorageService : StorageService {
      *  overflow drops on the floor rather than looping forever, better than hanging. */
     private fun restoreToSource(src: IItemHandler, stacks: List<ItemStack>) {
         for (s in stacks) {
-            val leftover = ItemHandlerHelper.insertItemStacked(src, s.copy(), false)
-            if (!leftover.isEmpty) {
-                // Defensive: the source somehow can't receive items it just emitted.
-                // Log once and leak rather than corrupt more state.
-                org.slf4j.LoggerFactory.getLogger("nodeworks-neoforge-storage").warn(
-                    "tryMoveAll rollback: source refused returning {} x{}. State may diverge.",
-                    s.item, leftover.count
-                )
+            val leftover = try {
+                ItemHandlerHelper.insertItemStacked(src, s.copy(), false)
+            } catch (e: Exception) {
+                s.copy()
             }
+            // The source can't take back items it just emitted. Spill rather than delete.
+            if (!leftover.isEmpty) MoveSpill.spill(leftover, "tryMoveAll rollback: the source refused the items")
         }
     }
 
@@ -379,7 +443,18 @@ class NeoForgeStorageService : StorageService {
         return null
     }
 
-    override fun findAllItemInfo(storage: ItemStorageHandle, filter: (String) -> Boolean): List<ItemInfo> {
+    override fun findAllItemInfo(storage: ItemStorageHandle, filter: (String) -> Boolean): List<ItemInfo> =
+        findAllItemInfoInRange(storage, 0, Int.MAX_VALUE, filter)
+
+    override fun slotCount(storage: ItemStorageHandle): Int =
+        (storage as? NeoForgeItemStorageHandle)?.handler?.slots ?: -1
+
+    override fun findAllItemInfoInRange(
+        storage: ItemStorageHandle,
+        from: Int,
+        until: Int,
+        filter: (String) -> Boolean,
+    ): List<ItemInfo> {
         val handler = (storage as NeoForgeItemStorageHandle).handler
         // Aggregation key is the full BufferKey so stacks with distinct
         // DataComponents (different potions, dyed armor, enchanted books) stay
@@ -388,7 +463,8 @@ class NeoForgeStorageService : StorageService {
         // hashed all five potion variants together and the Inventory Terminal
         // / network:find / card:find all displayed one with the wrong count.
         val aggregated = LinkedHashMap<damien.nodeworks.script.BufferKey.Key, ItemInfo>()
-        for (slot in 0 until handler.slots) {
+        val end = minOf(until, handler.slots)
+        for (slot in from.coerceAtLeast(0) until end) {
             val stack = handler.getStackInSlot(slot)
             if (stack.isEmpty) continue
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
@@ -614,7 +690,12 @@ class NeoForgeStorageService : StorageService {
     }
 }
 
-class NeoForgeItemStorageHandle(val handler: IItemHandler) : ItemStorageHandle
+/** [routed] is the storage's own handler when it was resolved from a capability, used by
+ *  [NeoForgeStorageService] for inserts the storage can route itself. Null for slot views. */
+class NeoForgeItemStorageHandle(
+    val handler: IItemHandler,
+    val routed: ResourceHandler<ItemResource>? = null,
+) : ItemStorageHandle
 
 class NeoForgeFluidStorageHandle(val handler: IFluidHandler) : FluidStorageHandle
 

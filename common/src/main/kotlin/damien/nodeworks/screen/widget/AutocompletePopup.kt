@@ -101,6 +101,11 @@ class AutocompletePopup(
     private var scrollOffset: Int = 0
     private val maxVisible: Int = 8
 
+    // Derived from [suggestions] once per [update], render reads them every frame.
+    private var hasRecipe = false
+    private var hasItemIcon = false
+    private var popupContentWidth = 0
+
     /** Optional resolver for the on-screen Y of a line's BOTTOM (relative to the editor's
      *  top-left), accounting for decoration heights above each line. Set by the caller
      *  after constructing the editor, without this the popup falls back to uniform line
@@ -143,7 +148,12 @@ class AutocompletePopup(
             return
         }
 
-        suggestions = newSuggestions
+        // Untyped registry contexts return every id. Ranking puts the best first and
+        // nobody scrolls tens of thousands of rows, so keep the head only.
+        suggestions = if (newSuggestions.size > MAX_SUGGESTIONS) newSuggestions.take(MAX_SUGGESTIONS) else newSuggestions
+        hasRecipe = suggestions.any { it.recipe != null }
+        hasItemIcon = suggestions.any { it.itemIconStack != null }
+        popupContentWidth = suggestions.maxOf { rowContentWidth(it) }
         selectedIndex = 0
         scrollOffset = 0
         visible = true
@@ -253,8 +263,6 @@ class AutocompletePopup(
 
         // Rows with a recipe icon strip or an item icon need extra height.
         // Stretch the whole popup so alignment stays consistent.
-        val hasRecipe = suggestions.any { it.recipe != null }
-        val hasItemIcon = suggestions.any { it.itemIconStack != null }
         val baseRowH = font.lineHeight + 2
         val itemHeight = when {
             hasRecipe -> maxOf(baseRowH, RecipeHintRenderer.HINT_HEIGHT + 1)
@@ -263,9 +271,9 @@ class AutocompletePopup(
         }
         val visibleCount = minOf(suggestions.size, maxVisible)
         // Each row has a Kind badge on the left, then either an icon strip
-        // (recipe rows) or plain text. Width is the max of the two across all
-        // visible suggestions so columns line up.
-        val popupWidth = suggestions.maxOf { rowContentWidth(it) } + 8 + BADGE_SIZE + BADGE_GAP
+        // (recipe rows) or plain text. Width is the max across all suggestions
+        // so columns line up while scrolling.
+        val popupWidth = popupContentWidth + 8 + BADGE_SIZE + BADGE_GAP
         val actualHeight = visibleCount * itemHeight + 4
 
         // Keep the popup within the game window, same flip-and-clamp policy the hover
@@ -413,6 +421,22 @@ class AutocompletePopup(
     }
 
     companion object {
+        /** Most rows the popup keeps per update. */
+        private const val MAX_SUGGESTIONS = 200
+
+        /** Suggestion rows for the registry id lists, by list identity. Those lists come
+         *  from [damien.nodeworks.client.RegistryIdCache] and only change on tag reload,
+         *  so their rows are built once instead of once per keystroke. */
+        private val cachedRows = java.util.IdentityHashMap<List<String>, MutableMap<Kind, List<Suggestion>>>()
+
+        private fun rowsFor(items: List<String>, kind: Kind): List<Suggestion> {
+            // Only the three registry lists are cached, so this holds one snapshot's
+            // lists. A new snapshot after a tag reload replaces them.
+            if (cachedRows.size >= 3 && items !in cachedRows) cachedRows.clear()
+            return cachedRows.getOrPut(items) { HashMap() }
+                .getOrPut(kind) { items.map { Suggestion(it, it, kind = kind) } }
+        }
+
         /** Size of the square Kind badge drawn in each row (px). Chosen so the single-letter
          *  glyph centers neatly with the default font. */
         private const val BADGE_SIZE = 9
@@ -537,8 +561,10 @@ class AutocompletePopup(
     }
 
     private fun fuzzyStrings(query: String, items: List<String>, kind: Kind = Kind.STRING): List<Suggestion> {
-        return if (query.isEmpty()) items.map { suggest(it, kind = kind) }
-        else items.map { suggest(it, kind = kind) }.let { FuzzyMatch.filter(query, it) }
+        // Tag lists are rebuilt per call, caching them would evict the registry rows.
+        val stable = items === itemIds || items === fluidIds || items === blockIds
+        val rows = if (stable) rowsFor(items, kind) else items.map { suggest(it, kind = kind) }
+        return if (query.isEmpty()) rows else FuzzyMatch.filter(query, rows)
     }
 
     // ========== Cursor Context Parser ==========
@@ -2052,7 +2078,7 @@ class AutocompletePopup(
             // suggestions because vanilla doesn't care about ingredient order, there's no
             // "flip-flop" to resolve in the completion layer itself.
             ctx.funcExpr.endsWith("network:shapeless") -> {
-                val suggestions = itemIds.map { Suggestion(it, it, kind = Kind.STRING) }
+                val suggestions = rowsFor(itemIds, Kind.STRING)
                 FuzzyMatch.filter(ctx.partial, suggestions).take(20)
             }
 
