@@ -292,6 +292,28 @@ object Ae2Storage {
         return out
     }
 
+    /** Visit matching item types as one-item templates with their counts, in snapshot
+     *  order, until [visit] returns false. */
+    fun forEachStack(h: Ae2ItemStorageHandle, filter: (ItemStack) -> Boolean, visit: (ItemStack, Long) -> Boolean) {
+        forEachItem(h, { true }) { key, n ->
+            if (filter(key.readOnlyStack) && !visit(key.toStack(1), n)) return
+        }
+    }
+
+    /** How many of [template]'s exact type the network holds. */
+    fun countOf(h: Ae2ItemStorageHandle, template: ItemStack): Long {
+        val key = AEItemKey.of(template) ?: return 0L
+        return snapshot(h.me, h.grid).get(key)
+    }
+
+    /** Extract up to [maxCount] of [template]'s exact type, a direct key lookup. */
+    fun extractOf(h: Ae2ItemStorageHandle, template: ItemStack, maxCount: Long): List<ItemStack> {
+        val key = AEItemKey.of(template) ?: return emptyList()
+        val out = ArrayList<ItemStack>()
+        extractStacks(h.me, key, maxCount, MAX_STACKS_PER_EXTRACT, out)
+        return out
+    }
+
     /** How many of [stacks] the network would accept. Each key is simulated on its own,
      *  so tight byte space shared between keys can read slightly high. */
     fun simulateInsertStacks(h: Ae2ItemStorageHandle, stacks: List<ItemStack>): Long {
@@ -308,6 +330,7 @@ object Ae2Storage {
         val key = AEItemKey.of(stack) ?: return 0
         val put = h.me.insert(key, stack.count.toLong(), Actionable.MODULATE, source)
         noteChange(h.me, key, put)
+        if (put > 0L) damien.nodeworks.platform.MoveDeadline.progressed()
         return put.toInt()
     }
 
@@ -334,7 +357,7 @@ object Ae2Storage {
         var remaining = maxCount
         var moved = 0L
         forEachItem(src, { true }) { key, available ->
-            if (remaining <= 0L) return moved
+            if (remaining <= 0L || damien.nodeworks.platform.MoveDeadline.expired()) return moved
             if (!filter(key.readOnlyStack)) return@forEachItem
             val got = src.me.extract(key, minOf(remaining, available), Actionable.MODULATE, source)
             if (got <= 0L) return@forEachItem
@@ -346,6 +369,7 @@ object Ae2Storage {
                 throw e
             }
             noteChange(dst.me, key, put)
+            if (put > 0L) damien.nodeworks.platform.MoveDeadline.progressed()
             if (put < got) giveBack(src, key, got - put)
             moved += put
             remaining -= put

@@ -35,7 +35,7 @@ class NeoForgeStorageService : StorageService {
         var remaining = maxCount
 
         for (slot in 0 until src.slots) {
-            if (remaining <= 0) break
+            if (remaining <= 0 || MoveDeadline.expired()) break
             val stack = src.getStackInSlot(slot)
             if (stack.isEmpty) continue
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
@@ -62,7 +62,7 @@ class NeoForgeStorageService : StorageService {
         var remaining = maxCount
 
         for (slot in 0 until src.slots) {
-            if (remaining <= 0) break
+            if (remaining <= 0 || MoveDeadline.expired()) break
             val stack = src.getStackInSlot(slot)
             if (stack.isEmpty) continue
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
@@ -96,7 +96,7 @@ class NeoForgeStorageService : StorageService {
         var remaining = maxCount
 
         for (slot in 0 until src.slots) {
-            if (remaining <= 0) break
+            if (remaining <= 0 || MoveDeadline.expired()) break
             val stack = src.getStackInSlot(slot)
             if (stack.isEmpty) continue
             // Predicate sees the full slot stack for component-aware matching.
@@ -227,10 +227,12 @@ class NeoForgeStorageService : StorageService {
             Transaction.openRoot().use { tx ->
                 val inserted = routed.insert(ItemResource.of(stack), stack.count, tx)
                 if (!simulate) tx.commit()
+                if (!simulate && inserted > 0) MoveDeadline.progressed()
                 return inserted
             }
         }
         val leftover = ItemHandlerHelper.insertItemStacked(handle.handler, stack.copy(), simulate)
+        if (!simulate && leftover.count < stack.count) MoveDeadline.progressed()
         return stack.count - leftover.count
     }
 
@@ -268,6 +270,23 @@ class NeoForgeStorageService : StorageService {
             remaining -= take
         }
         return ArrayList(merged.values)
+    }
+
+    /** The item types [dest] can still take, as one-item templates, when it is a plain
+     *  inventory with no empty slot: only what is already in it. Null when it might take
+     *  anything, because it has an empty slot or routes inserts itself. */
+    fun acceptedTypes(dest: ItemStorageHandle): List<ItemStack>? {
+        val handle = dest as NeoForgeItemStorageHandle
+        val routed = handle.routed
+        if (routed != null && routesInsert(routed)) return null
+        val handler = handle.handler
+        val types = LinkedHashMap<ItemResource, ItemStack>()
+        for (slot in 0 until handler.slots) {
+            val stack = handler.getStackInSlot(slot)
+            if (stack.isEmpty) return null
+            types.putIfAbsent(ItemResource.of(stack), stack.copyWithCount(1))
+        }
+        return ArrayList(types.values)
     }
 
     /** How many of [stacks] [dest] would accept, all simulated in one transaction that is

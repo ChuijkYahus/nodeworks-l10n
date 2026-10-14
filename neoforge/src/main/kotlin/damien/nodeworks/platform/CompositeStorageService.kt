@@ -20,6 +20,10 @@ import org.slf4j.LoggerFactory
  */
 class CompositeStorageService(private val base: NeoForgeStorageService) : StorageService {
 
+    private companion object {
+        const val ROUND_ITEMS = 4096L
+    }
+
     private val logger = LoggerFactory.getLogger("nodeworks-storage")
 
     private fun ae2(h: ItemStorageHandle): Ae2ItemStorageHandle? =
@@ -168,19 +172,52 @@ class CompositeStorageService(private val base: NeoForgeStorageService) : Storag
         for (i in from until taken.size) returnToSource(source, dest, taken[i])
     }
 
-    /** Moves in rounds so a huge request against an unbounded source (an ME network)
-     *  never holds more than one extraction's worth of stacks at a time. Stops when the
-     *  request is met, the source runs dry, or dest starts rejecting. */
+    /** Moves in rounds of at most [ROUND_ITEMS] so a huge request against an unbounded
+     *  source (an ME network) holds little in flight and can stop at a deadline between
+     *  rounds. Stops when the request is met, the source runs dry, dest starts rejecting,
+     *  or the [MoveDeadline] passes. */
     private fun moveInRounds(source: ItemStorageHandle, dest: ItemStorageHandle, maxCount: Long, extract: (Long) -> List<ItemStack>): Long {
         var remaining = maxCount
         var moved = 0L
-        while (remaining > 0L) {
-            val taken = extract(remaining)
+        while (remaining > 0L && !MoveDeadline.expired()) {
+            val taken = extract(minOf(remaining, ROUND_ITEMS))
             if (taken.isEmpty()) break
             val movedNow = moveStacks(source, dest, taken)
             moved += movedNow
             remaining -= movedNow
             if (movedNow < taken.sumOf { it.count.toLong() }) break
+        }
+        return moved
+    }
+
+    /** ME into a slotted storage, one item type at a time. Each type is simulated first and
+     *  only what fits is taken, so a destination that only accepts some items (a chest
+     *  full of one item, drawers) still gets them, instead of the move giving up when
+     *  the first items in the network don't fit. A full plain inventory can only take
+     *  what it already holds, so those types are looked up directly instead of
+     *  walking every type in the network. */
+    private fun moveFromMe(s: Ae2ItemStorageHandle, dest: ItemStorageHandle, filter: (ItemStack) -> Boolean, maxCount: Long): Long {
+        var remaining = maxCount
+        var moved = 0L
+        val step: (ItemStack, Long) -> Boolean = step@{ template, available ->
+            val want = minOf(remaining, available, Int.MAX_VALUE.toLong())
+            if (want <= 0L) return@step remaining > 0L
+            val fits = base.simulateInsertStacks(dest, listOf(template.copyWithCount(want.toInt()))) ?: want
+            if (fits > 0L) {
+                val movedNow = moveStacks(s, dest, Ae2Storage.extractOf(s, template, fits))
+                moved += movedNow
+                remaining -= movedNow
+            }
+            remaining > 0L && !MoveDeadline.expired()
+        }
+        val accepted = base.acceptedTypes(dest)
+        if (accepted == null) {
+            Ae2Storage.forEachStack(s, filter, step)
+        } else {
+            for (template in accepted) {
+                if (!filter(template)) continue
+                if (!step(template, Ae2Storage.countOf(s, template))) break
+            }
         }
         return moved
     }
@@ -191,6 +228,7 @@ class CompositeStorageService(private val base: NeoForgeStorageService) : Storag
         val s = ae2(source)
         val d = ae2(dest)
         if (s != null && d != null) return Ae2Storage.moveKeys(s, d, { filter(idOf(it)) }, maxCount)
+        if (s != null) return moveFromMe(s, dest, { filter(idOf(it)) }, maxCount)
         return moveInRounds(source, dest, maxCount) { extractItemStacksMatching(source, filter, it) }
     }
 
@@ -201,6 +239,7 @@ class CompositeStorageService(private val base: NeoForgeStorageService) : Storag
         val s = ae2(source)
         val d = ae2(dest)
         if (s != null && d != null) return Ae2Storage.moveKeys(s, d, pred, maxCount)
+        if (s != null) return moveFromMe(s, dest, pred, maxCount)
         return moveInRounds(source, dest, maxCount) { extractStacksByPredicate(source, pred, it) }
     }
 
@@ -210,6 +249,7 @@ class CompositeStorageService(private val base: NeoForgeStorageService) : Storag
         val s = ae2(source)
         val d = ae2(dest)
         if (s != null && d != null) return Ae2Storage.moveKeys(s, d, filter, maxCount)
+        if (s != null) return moveFromMe(s, dest, filter, maxCount)
         return moveInRounds(source, dest, maxCount) { extractStacksByPredicate(source, filter, it) }
     }
 
