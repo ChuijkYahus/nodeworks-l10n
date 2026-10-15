@@ -31,6 +31,14 @@ object CraftTreeBuilder {
          *  "use the Instruction Set's stored recipe verbatim", which is also
          *  the default for substitution-disabled patterns. */
         val resolvedRecipe: List<String>? = null,
+        /** For process_template nodes whose Processing Set has substitutions on: the
+         *  concrete item each recipe input uses in this craft, parallel to the set's
+         *  inputs. Null means the set's own inputs. */
+        val resolvedInputs: List<damien.nodeworks.script.RecipeIngredient>? = null,
+        /** For storage nodes: pull only stacks whose components equal [componentsPatch],
+         *  so a plain Processing Set input never ends up with a renamed or otherwise
+         *  varied copy its step can't use. Instruction Set inputs take any variant. */
+        val exactVariant: Boolean = false,
         /** Component patch identifying the requested variant. Empty for
          *  plain items (the common case). Carries through to the planner so
          *  Pull ops can filter storage by component, e.g. asking specifically
@@ -143,7 +151,7 @@ object CraftTreeBuilder {
             // Swap exemplar ingredients for in-stock alternatives when the
             // pattern allows substitutions. No-op when substitutions are off.
             val (concreteRecipe, swapped) = resolveSubstitutedRecipe(
-                originalRecipe, info.allowSubstitutions, level, snapshot, batches, reserved,
+                originalRecipe, info.allowSubstitutions, level, snapshot, batches, reserved, visited,
             )
 
             val ingredientCounts = mutableMapOf<String, Int>()
@@ -211,7 +219,13 @@ object CraftTreeBuilder {
             val batches = (count + perBatch - 1) / perBatch
             val actualCount = batches * perBatch
 
-            val children = api.inputs.flatMap { ingr ->
+            // With substitutions on, each input is first pinned to the concrete item this
+            // craft uses: a stocked or craftable tag member, or the stocked component
+            // variant. Everything downstream, pulls included, then works on those items.
+            val resolvedInputs = if (api.fuzzy) {
+                resolveProcessingInputs(api.inputs, level, snapshot, batches, reserved, visited)
+            } else null
+            val children = (resolvedInputs ?: api.inputs).flatMap { ingr ->
                 // Pass through each ingredient's componentsPatch so the
                 // recursive resolveIngredient call (which generates Pull op
                 // sources) can ask for the specific variant. Without this, a
@@ -220,6 +234,7 @@ object CraftTreeBuilder {
                 resolveIngredient(
                     ingr.itemId, ingr.count * batches, level, snapshot, depth, visited, reserved,
                     ingredientPatch = ingr.stack.componentsPatch,
+                    exactVariant = true,
                 )
             }
 
@@ -234,6 +249,7 @@ object CraftTreeBuilder {
             visited.remove(variantKey)
             return CraftTreeNode(
                 itemId, rootName, actualCount, source, api.name, resolvedBy, availableFromStorage, children,
+                resolvedInputs = resolvedInputs,
                 componentsPatch = rootPatch,
             )
         }
@@ -276,6 +292,10 @@ object CraftTreeBuilder {
          *  different variants of the same itemId (e.g. swiftness + fire-res
          *  potion) don't double-count or double-reserve the same storage items. */
         ingredientPatch: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+        /** Count and pull only stacks whose components equal [ingredientPatch], a plain
+         *  patch included. Processing Set steps consume one exact bucket, so anything
+         *  else pulled would sit in the buffer unused. */
+        exactVariant: Boolean = false,
     ): List<CraftTreeNode> {
         val componentsHash = damien.nodeworks.script.BufferKey.componentsHash(ingredientPatch)
         // Reservation key embeds the components hash so different variants of
@@ -283,7 +303,7 @@ object CraftTreeBuilder {
         // (empty hash) keep the old `itemId` key so existing reservation
         // counts roll forward without migration.
         val reservedKey = if (componentsHash.isEmpty()) ingId else "$ingId#$componentsHash"
-        val ingInStorage = if (componentsHash.isEmpty()) {
+        val ingInStorage = if (componentsHash.isEmpty() && !exactVariant) {
             NetworkStorageHelper.countItemsInt(level, snapshot, ingId)
         } else {
             NetworkStorageHelper.countVariantAcrossNetworkInt(level, snapshot, ingId, ingredientPatch)
@@ -296,6 +316,7 @@ object CraftTreeBuilder {
                 reserved[reservedKey] = ingReserved + needed
                 listOf(CraftTreeNode(
                     ingId, getItemName(ingId, ingredientPatch), needed, "storage", "", "storage", ingAvailable, emptyList(),
+                    exactVariant = exactVariant,
                     componentsPatch = ingredientPatch,
                 ))
             }
@@ -303,6 +324,7 @@ object CraftTreeBuilder {
                 reserved[reservedKey] = ingReserved + ingAvailable
                 val fromStorage = CraftTreeNode(
                     ingId, getItemName(ingId, ingredientPatch), ingAvailable, "storage", "", "storage", ingAvailable, emptyList(),
+                    exactVariant = exactVariant,
                     componentsPatch = ingredientPatch,
                 )
                 val toCraft = needed - ingAvailable
@@ -353,10 +375,11 @@ object CraftTreeBuilder {
             var score = 0
             if (hasLuaHandler || hasBlockHandler) score += 10
             for (ingr in api.inputs) {
-                val available = if (ingr.componentsHash.isEmpty()) {
-                    NetworkStorageHelper.countItems(level, snapshot, ingr.itemId)
-                } else {
-                    NetworkStorageHelper.countVariantAcrossNetwork(level, snapshot, ingr.itemId, ingr.stack.componentsPatch)
+                val tag = ingr.tag
+                val available = when {
+                    api.fuzzy && tag != null -> NetworkStorageHelper.countItems(level, snapshot, "#$tag")
+                    api.fuzzy || ingr.componentsHash.isEmpty() -> NetworkStorageHelper.countItems(level, snapshot, ingr.itemId)
+                    else -> NetworkStorageHelper.countVariantAcrossNetwork(level, snapshot, ingr.itemId, ingr.stack.componentsPatch)
                 }
                 if (available >= ingr.count.toLong()) score += 1
             }
@@ -392,11 +415,11 @@ object CraftTreeBuilder {
     }
 
     /** Substitution-aware version of the 9-slot recipe: walks each grid slot
-     *  and swaps the exemplar item for a stocked alternative the recipe's
-     *  `Ingredient` accepts. Tracks running per-slot consumption so a single
-     *  recipe with 8 plank slots can spread across "4 oak + 4 birch" rather
-     *  than picking 8 of one type that only has 4 in stock. No-op when the
-     *  pattern has substitutions disabled. */
+     *  and swaps the exemplar item for a stocked or craftable alternative the
+     *  recipe's `Ingredient` accepts. Tracks running per-slot consumption so a
+     *  single recipe with 8 plank slots can spread across "4 oak + 4 birch"
+     *  rather than picking 8 of one type that only has 4 in stock. No-op when
+     *  the pattern has substitutions disabled. */
     private fun resolveSubstitutedRecipe(
         recipe: List<String>,
         allowSubstitutions: Boolean,
@@ -404,6 +427,7 @@ object CraftTreeBuilder {
         snapshot: NetworkSnapshot,
         batches: Int,
         reserved: MutableMap<String, Int>,
+        visited: Set<damien.nodeworks.script.BufferKey.Key>,
     ): Pair<List<String>, Boolean> {
         if (!allowSubstitutions) return recipe to false
 
@@ -434,6 +458,12 @@ object CraftTreeBuilder {
             return maxOf(0, total - (reserved[id] ?: 0) - (local[id] ?: 0))
         }
 
+        // An alternative with a recipe on this network can be crafted for the slot. One
+        // already being resolved further up the tree is left out, it would only loop.
+        fun craftable(id: String): Boolean =
+            damien.nodeworks.script.BufferKey.Key(id, "") !in visited &&
+                (snapshot.findInstructionSet(id) != null || snapshot.findProcessingApi(id) != null)
+
         val concrete = recipe.toMutableList()
         var swapped = false
         for (slot in 0 until 9) {
@@ -448,7 +478,7 @@ object CraftTreeBuilder {
             if (ingredientIdx < 0) continue
             val candidates = candidatesPerIngredient[ingredientIdx]
 
-            val choice = pickSlotCandidate(originalId, candidates, batches, ::availableFor) ?: continue
+            val choice = pickSlotCandidate(originalId, candidates, batches, ::availableFor, ::craftable) ?: continue
             if (choice != originalId) swapped = true
             concrete[slot] = choice
             local[choice] = (local[choice] ?: 0) + batches
@@ -456,23 +486,119 @@ object CraftTreeBuilder {
         return concrete to swapped
     }
 
-    /** Pick a candidate item id with at least [needed] available. Prefers
-     *  [preferred] when it still has stock, so authored recipes keep their
-     *  intended item when nothing forces a swap. Otherwise picks whichever
-     *  alternative has the most stock left, keeping the tree's unique-types
-     *  count from growing more than necessary. */
+    /** With substitutions on, the concrete item each Processing Set input uses for this
+     *  craft, parallel to [inputs]. A tag input takes a member that is stocked, else one the
+     *  network can craft, else its example item. Any other input takes its most stocked
+     *  component variant, else the example. Picks reserve stock across slots so two slots
+     *  never count the same items. */
+    private fun resolveProcessingInputs(
+        inputs: List<RecipeIngredient>,
+        level: ServerLevel,
+        snapshot: NetworkSnapshot,
+        batches: Int,
+        reserved: Map<String, Int>,
+        visited: Set<damien.nodeworks.script.BufferKey.Key>,
+    ): List<RecipeIngredient> {
+        val local = HashMap<String, Int>()
+        // Every variant of an item counts here, so every variant's reservation comes off.
+        fun reservedAll(map: Map<String, Int>, id: String): Int =
+            map.entries.sumOf { (key, n) -> if (key == id || key.startsWith("$id#")) n else 0 }
+        fun availableFor(id: String): Int {
+            val total = NetworkStorageHelper.countItemsInt(level, snapshot, id)
+            return maxOf(0, total - reservedAll(reserved, id) - reservedAll(local, id))
+        }
+        fun craftable(id: String): Boolean =
+            damien.nodeworks.script.BufferKey.Key(id, "") !in visited &&
+                (snapshot.findInstructionSet(id) != null || snapshot.findProcessingApi(id) != null)
+
+        return inputs.map { ingr ->
+            val needed = ingr.count * batches
+            val tag = ingr.tag
+            // First the item: a tag input picks among the tag's members, any other keeps its own.
+            val itemId = if (tag != null) {
+                val candidates = damien.nodeworks.card.ItemTagLookup.membersOf(tag)
+                    .mapNotNull { BuiltInRegistries.ITEM.getKey(it)?.toString() }
+                pickSlotCandidate(ingr.itemId, candidates, needed, ::availableFor, ::craftable) ?: ingr.itemId
+            } else ingr.itemId
+            val item = Identifier.tryParse(itemId)?.let { BuiltInRegistries.ITEM.getValue(it) }
+                ?: return@map ingr
+            // Then the variant: the example's own when it is stocked enough, else another
+            // that covers the whole demand, so the pull and the step agree on exactly which
+            // items to use. Short stock everywhere keeps the example, which may be craftable.
+            // A tag member other than the example starts from its plain form, tags are
+            // item-based.
+            val base = if (itemId == ingr.itemId) ingr.stack.copyWithCount(1) else ItemStack(item)
+            val baseHash = damien.nodeworks.script.BufferKey.componentsHash(base)
+            fun reservedKey(hash: String) = if (hash.isEmpty()) itemId else "$itemId#$hash"
+            val variants = variantCounts(level, snapshot, itemId)
+            fun available(v: Pair<net.minecraft.core.component.DataComponentPatch, Long>): Int {
+                val key = reservedKey(damien.nodeworks.script.BufferKey.componentsHash(v.first))
+                val stocked = v.second.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                return maxOf(0, stocked - (reserved[key] ?: 0) - (local[key] ?: 0))
+            }
+            val baseVariant = variants.firstOrNull { damien.nodeworks.script.BufferKey.componentsHash(it.first) == baseHash }
+            val pick = if (baseVariant != null && available(baseVariant) >= needed) baseVariant
+                else variants.maxByOrNull { available(it) }?.takeIf { available(it) >= needed } ?: baseVariant
+            val hash = if (pick == null) baseHash else damien.nodeworks.script.BufferKey.componentsHash(pick.first)
+            local[reservedKey(hash)] = (local[reservedKey(hash)] ?: 0) + needed
+            when {
+                // Nothing stocked, keep the base so crafting or the missing report is by it.
+                pick == null || hash == baseHash -> if (itemId == ingr.itemId) ingr else RecipeIngredient(base, ingr.count)
+                else -> RecipeIngredient(ItemStack(item).apply { applyComponents(pick.first) }, ingr.count)
+            }
+        }
+    }
+
+    /** How many of each component variant of [itemId] network storage holds, each with a
+     *  patch that identifies it. Shared storage reached through several cards counts once. */
+    private fun variantCounts(
+        level: ServerLevel,
+        snapshot: NetworkSnapshot,
+        itemId: String,
+    ): List<Pair<net.minecraft.core.component.DataComponentPatch, Long>> {
+        val byHash = LinkedHashMap<String, Pair<net.minecraft.core.component.DataComponentPatch, Long>>()
+        val seen = HashSet<net.minecraft.core.BlockPos>()
+        for (card in NetworkStorageHelper.getStorageCards(snapshot)) {
+            val cap = card.capability as? damien.nodeworks.card.StorageSideCapability ?: continue
+            if (!seen.add(cap.adjacentPos)) continue
+            val storage = NetworkStorageHelper.getStorage(level, card) ?: continue
+            val infos = try {
+                PlatformServices.storage.findAllItemInfo(storage) { it == itemId }
+            } catch (_: Exception) { continue }
+            for (info in infos) {
+                val hash = damien.nodeworks.script.BufferKey.componentsHash(info.componentsPatch)
+                val prev = byHash[hash]
+                byHash[hash] = (prev?.first ?: info.componentsPatch) to ((prev?.second ?: 0L) + info.count)
+            }
+        }
+        return byHash.values.toList()
+    }
+
+    /** Pick a candidate item id for a slot. Prefers [preferred] when it has enough
+     *  stock, so authored recipes keep their intended item when nothing forces a
+     *  swap, then whichever alternative has the most stock, keeping the tree's
+     *  unique-types count from growing more than necessary. When nothing is
+     *  stocked enough, prefers one the network can craft, so a tag recipe saved
+     *  with an exotic member still crafts from the plain one the player makes. */
     private fun pickSlotCandidate(
         preferred: String,
         candidates: List<String>,
         needed: Int,
         availableFor: (String) -> Int,
+        craftable: (String) -> Boolean,
     ): String? {
         if (availableFor(preferred) >= needed) return preferred
-        return candidates
+        candidates
             .filter { it != preferred }
             .maxByOrNull { availableFor(it) }
             ?.takeIf { availableFor(it) >= needed }
-            ?: candidates.firstOrNull { availableFor(it) > 0 }
+            ?.let { return it }
+        if (craftable(preferred)) return preferred
+        // Most stock first, so the least has to be crafted.
+        candidates.filter { it != preferred && craftable(it) }
+            .maxByOrNull { availableFor(it) }
+            ?.let { return it }
+        return candidates.firstOrNull { availableFor(it) > 0 }
     }
 
     /** Assemble the 9-slot pattern against the vanilla RecipeManager and return the per-craft
