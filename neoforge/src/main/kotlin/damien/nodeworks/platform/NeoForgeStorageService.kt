@@ -28,20 +28,38 @@ class NeoForgeStorageService : StorageService {
         return NeoForgeItemStorageHandle(IItemHandler.of(resourceHandler), resourceHandler)
     }
 
-    override fun moveItems(source: ItemStorageHandle, dest: ItemStorageHandle, filter: (String) -> Boolean, maxCount: Long): Long {
+    override fun moveItems(
+        source: ItemStorageHandle,
+        dest: ItemStorageHandle,
+        filter: (String) -> Boolean,
+        maxCount: Long,
+        cursor: ScanCursor?,
+    ): Long {
         val src = (source as NeoForgeItemStorageHandle).handler
         val dst = (dest as NeoForgeItemStorageHandle).handler
         var total = 0L
         var remaining = maxCount
+        val refused = HashSet<ItemResource>()
+        val slots = src.slots
+        if (slots <= 0) return 0L
+        // Each slot is visited at most once per call, starting where the last call stopped.
+        val start = cursor?.slot?.takeIf { it in 0 until slots } ?: 0
 
-        for (slot in 0 until src.slots) {
-            if (remaining <= 0 || MoveDeadline.expired()) break
+        for (i in 0 until slots) {
+            val slot = (start + i) % slots
+            if (remaining <= 0 || MoveDeadline.expired()) {
+                cursor?.slot = slot
+                return total
+            }
+            // A source can shrink mid-scan, never read past its current end.
+            if (slot >= src.slots) continue
             val stack = src.getStackInSlot(slot)
             if (stack.isEmpty) continue
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
             if (!filter(itemId)) continue
+            if (ItemResource.of(stack) in refused) continue
 
-            val moved = moveFromSlot(src, slot, dest, remaining)
+            val moved = moveFromSlot(src, slot, dest, remaining, refused)
             total += moved
             remaining -= moved
         }
@@ -53,6 +71,7 @@ class NeoForgeStorageService : StorageService {
         val dst = (dest as NeoForgeItemStorageHandle).handler
         var total = 0L
         var remaining = maxCount
+        val refused = HashSet<ItemResource>()
 
         for (slot in 0 until src.slots) {
             if (remaining <= 0 || MoveDeadline.expired()) break
@@ -61,8 +80,9 @@ class NeoForgeStorageService : StorageService {
             val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
             val hasData = stack.componentsPatch.size() > 0
             if (!filter(itemId, hasData)) continue
+            if (ItemResource.of(stack) in refused) continue
 
-            val moved = moveFromSlot(src, slot, dest, remaining)
+            val moved = moveFromSlot(src, slot, dest, remaining, refused)
             total += moved
             remaining -= moved
         }
@@ -80,6 +100,7 @@ class NeoForgeStorageService : StorageService {
         val dst = (dest as NeoForgeItemStorageHandle).handler
         var total = 0L
         var remaining = maxCount
+        val refused = HashSet<ItemResource>()
 
         for (slot in 0 until src.slots) {
             if (remaining <= 0 || MoveDeadline.expired()) break
@@ -87,8 +108,9 @@ class NeoForgeStorageService : StorageService {
             if (stack.isEmpty) continue
             // Predicate sees the full slot stack for component-aware matching.
             if (!filter(stack)) continue
+            if (ItemResource.of(stack) in refused) continue
 
-            val moved = moveFromSlot(src, slot, dest, remaining)
+            val moved = moveFromSlot(src, slot, dest, remaining, refused)
             total += moved
             remaining -= moved
         }
@@ -116,19 +138,25 @@ class NeoForgeStorageService : StorageService {
     }
 
     /** Move up to [amount] from one source slot into [dest], one stack per round, until
-     *  it is met, the slot runs dry, dest refuses, or the [MoveDeadline] passes. */
-    private fun moveFromSlot(src: IItemHandler, slot: Int, dest: NeoForgeItemStorageHandle, amount: Long): Long {
+     *  it is met, the slot runs dry, dest refuses, or the [MoveDeadline] passes. A type dest
+     *  refuses goes in [refused] so the caller skips its other slots. Dest only fills up during
+     *  one move, so a refused type can't fit later in it. */
+    private fun moveFromSlot(src: IItemHandler, slot: Int, dest: NeoForgeItemStorageHandle, amount: Long, refused: MutableSet<ItemResource>): Long {
         var moved = 0L
         var first: ItemStack? = null
         while (moved < amount) {
             if (moved > 0L && MoveDeadline.expired()) break
+            if (slot >= src.slots) break
             val offered = src.extractItem(slot, minOf(amount - moved, Int.MAX_VALUE.toLong()).toInt(), true)
             if (offered.isEmpty) break
             // Same guard as [drainSlot].
             if (first != null && !ItemStack.isSameItemSameComponents(offered, first)) break
             if (first == null) first = offered.copyWithCount(1)
             val inserted = insertInto(dest, offered, simulate = false)
-            if (inserted <= 0) break
+            if (inserted <= 0) {
+                refused += ItemResource.of(offered)
+                break
+            }
             val taken = src.extractItem(slot, inserted, false).count
             moved += inserted
             // A source giving back less than it offered would duplicate, never repeat that.
@@ -190,6 +218,16 @@ class NeoForgeStorageService : StorageService {
             // preserves durability, enchantments, custom names, dye colour, etc.
             remaining -= drainSlot(handler, slot, remaining) { out.add(it) }
         }
+        return out
+    }
+
+    /** Take up to [maxCount] from one [slot] of [storage] as real stacks, components intact.
+     *  Empty when the slot doesn't exist (any more). */
+    fun extractFromSlot(storage: ItemStorageHandle, slot: Int, maxCount: Long): List<ItemStack> {
+        val handler = (storage as NeoForgeItemStorageHandle).handler
+        if (maxCount <= 0L || slot !in 0 until handler.slots) return emptyList()
+        val out = ArrayList<ItemStack>()
+        drainSlot(handler, slot, maxCount) { out.add(it) }
         return out
     }
 
@@ -268,22 +306,28 @@ class NeoForgeStorageService : StorageService {
         insertInto(storage as NeoForgeItemStorageHandle, stack, simulate = false)
 
     /** What an extract of [maxCount] matching items would return, merged to one stack per
-     *  distinct item and components with the total as its count. Read-only. */
-    fun previewStacks(storage: ItemStorageHandle, filter: (ItemStack) -> Boolean, maxCount: Long): List<ItemStack> {
+     *  distinct item and components with the total as its count, at most [maxStacks] of
+     *  them. Read-only. The flag is true when every slot was looked at. */
+    fun previewStacks(storage: ItemStorageHandle, filter: (ItemStack) -> Boolean, maxCount: Long, maxStacks: Int): Pair<List<ItemStack>, Boolean> {
         val handler = (storage as NeoForgeItemStorageHandle).handler
         val merged = LinkedHashMap<ItemResource, ItemStack>()
         var remaining = maxCount
         for (slot in 0 until handler.slots) {
-            if (remaining <= 0L) break
+            if (remaining <= 0L) return ArrayList(merged.values) to false
             val stack = handler.getStackInSlot(slot)
             if (stack.isEmpty || !filter(stack)) continue
             val take = minOf(remaining, stack.count.toLong()).toInt()
             val key = ItemResource.of(stack)
             val existing = merged[key]
-            if (existing == null) merged[key] = stack.copyWithCount(take) else existing.grow(take)
+            if (existing == null) {
+                if (merged.size >= maxStacks) return ArrayList(merged.values) to false
+                merged[key] = stack.copyWithCount(take)
+            } else {
+                existing.grow(take)
+            }
             remaining -= take
         }
-        return ArrayList(merged.values)
+        return ArrayList(merged.values) to (remaining > 0L)
     }
 
     /** The item types [dest] can still take, as one-item templates, when it is a plain

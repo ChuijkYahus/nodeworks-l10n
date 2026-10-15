@@ -253,29 +253,180 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         val perBatch = expected.getCount().coerceAtLeast(1).toLong()
         val desired = op.outputCount.coerceAtLeast(1L)
         val executions = ((desired + perBatch - 1) / perBatch).coerceAtLeast(1L)
-        var done = 0L
-        while (done < executions) {
-            // Consume ingredients
-            for ((ing, needed) in ingredientCounts) {
-                val removed = cpu.removeFromBuffer(ing, needed.toLong())
-                if (removed < needed) {
-                    // Partial failure, put back what we already consumed this iteration, abort
-                    cpu.addToBuffer(ing, removed)
+        // What a recipe hands back, like an empty bucket or a worn crystal. A leftover that is
+        // one of the recipe's own ingredients is used again by the next craft, the way it stays
+        // in a player's grid. Everything else, and whatever is still held at the end, goes
+        // straight to network storage in one pass, so leftovers never fill the CPU buffer.
+        val held = mutableMapOf<String, ArrayDeque<ItemStack>>()
+        val spare = LinkedHashMap<damien.nodeworks.script.BufferKey.Key, Pair<ItemStack, Long>>()
+        fun keepLeftover(stack: ItemStack) {
+            if (stack.isEmpty) return
+            val key = damien.nodeworks.script.BufferKey.of(stack)
+            val prev = spare[key]
+            spare[key] = (prev?.first ?: stack.copyWithCount(1)) to ((prev?.second ?: 0L) + stack.count)
+        }
+        // Ingredients taken for the craft in progress, returned if anything throws before it lands.
+        var inHand: Array<ItemStack?>? = null
+        var inStandby: Array<ItemStack?>? = null
+        // Fresh ingredients a craft in this op used that the recipe gave nothing back for. Only
+        // an empty answer is ever reused, and only for the exact same stacks, so skipping the
+        // lookup can never invent a leftover or drop one the recipe would have given.
+        var noLeftoversFor: List<ItemStack?>? = null
+        try {
+            var done = 0L
+            while (done < executions) {
+                // Real stacks per slot, so leftovers come from the actual item (a crystal keeps its wear).
+                val taken = arrayOfNulls<ItemStack>(op.recipe.size)
+                // Slots holding a worn copy or a reused leftover rather than a fresh one.
+                val worn = BooleanArray(op.recipe.size)
+                // Fresh copies taken alongside a reused leftover, see below.
+                val standby = arrayOfNulls<ItemStack>(op.recipe.size)
+                inHand = taken
+                inStandby = standby
+                fun underflow(ing: String): CraftScheduler.OpResult {
+                    val had = taken.count { it != null && BuiltInRegistries.ITEM.getKey(it.item).toString() == ing }
+                    inHand = null
+                    inStandby = null
+                    for (s in taken) if (s != null) keepLeftover(s)
+                    for (s in standby) if (s != null) keepLeftover(s)
                     return CraftScheduler.OpResult.Failed(
-                        "Execute iteration underflow: $ing x$needed (had $removed)"
+                        "Execute iteration underflow: $ing x${ingredientCounts[ing]} (had $had)"
                     )
                 }
+                for ((slot, ing) in op.recipe.withIndex()) {
+                    if (ing.isEmpty()) continue
+                    val reused = held[ing]?.removeFirstOrNull()
+                    if (reused != null) {
+                        taken[slot] = reused
+                        worn[slot] = true
+                        // Still take the fresh copy planned for this craft, so the buffer drains as it
+                        // would without reuse and spare copies never crowd out the outputs. It goes to
+                        // storage, unless the reused one is turned down below and it is used instead.
+                        standby[slot] = takeIngredient(ing, allowWorn = false)?.first
+                        continue
+                    }
+                    val (stack, fresh) = takeIngredient(ing, allowWorn = true) ?: return underflow(ing)
+                    taken[slot] = stack
+                    worn[slot] = !fresh
+                }
+                // The output was worked out from fresh ingredients. If a worn copy would change it,
+                // like repairing damaged tools, those slots take fresh copies instead.
+                if (worn.any { it } && !craftsAsPlanned(recipeHolder.value(), taken, expected, lvl)) {
+                    for ((slot, ing) in op.recipe.withIndex()) {
+                        if (!worn[slot]) continue
+                        taken[slot]?.let { keepLeftover(it) }
+                        taken[slot] = null
+                        taken[slot] = standby[slot]?.also { standby[slot] = null }
+                            ?: takeIngredient(ing, allowWorn = false)?.first
+                            ?: return underflow(ing)
+                    }
+                }
+                for (i in standby.indices) {
+                    standby[i]?.let { keepLeftover(it) }
+                    standby[i] = null
+                }
+                inStandby = null
+                val output = expected.copyWithCount(expected.getCount())
+                // Keeps the recipe's components, the bucket stays plain.
+                val landed = cpu.addCraftedToBuffer(expectedItemId, output, output.getCount().toLong())
+                inHand = null
+                if (!landed) {
+                    for (s in taken) if (s != null) keepLeftover(s)
+                    return CraftScheduler.OpResult.Failed(
+                        "Buffer refused crafted $expectedItemId x${output.getCount()}"
+                    )
+                }
+                val allFresh = worn.none { it }
+                val leftovers: List<ItemStack> = if (allFresh && noLeftoversFor?.let { sameStacks(it, taken) } == true) {
+                    emptyList()
+                } else {
+                    // Copied before asking, in case a recipe changes its input stacks.
+                    val asked = if (allFresh) taken.map { it?.copy() } else null
+                    val result = try {
+                        recipeHolder.value().getRemainingItems(CraftingInput.of(3, 3, taken.map { it ?: ItemStack.EMPTY }))
+                    } catch (e: Exception) {
+                        logger.warn("Leftovers for {} threw, none kept: {}", expectedItemId, e.message)
+                        null
+                    }
+                    // A throw is not an answer, so only a real empty result is remembered.
+                    if (asked != null && result != null && result.all { it.isEmpty }) noLeftoversFor = asked
+                    result ?: emptyList()
+                }
+                for (left in leftovers) {
+                    if (left.isEmpty) continue
+                    val leftId = BuiltInRegistries.ITEM.getKey(left.item).toString()
+                    if (leftId in ingredientCounts) held.getOrPut(leftId) { ArrayDeque() }.addLast(left)
+                    else keepLeftover(left)
+                }
+                done++
             }
-            val output = expected.copyWithCount(expected.getCount())
-            // Keeps the recipe's components, the bucket stays plain.
-            if (!cpu.addCraftedToBuffer(expectedItemId, output, output.getCount().toLong())) {
-                return CraftScheduler.OpResult.Failed(
-                    "Buffer refused crafted $expectedItemId x${output.getCount()}"
-                )
+            return CraftScheduler.OpResult.Completed
+        } finally {
+            inHand?.forEach { if (it != null) keepLeftover(it) }
+            inStandby?.forEach { if (it != null) keepLeftover(it) }
+            for (stacks in held.values) for (s in stacks) keepLeftover(s)
+            if (spare.isNotEmpty()) {
+                val snap = snapshotForTick(lvl)
+                for ((template, count) in spare.values) tryReturnStackToStorage(template, count, lvl, snap)
             }
-            done++
         }
-        return CraftScheduler.OpResult.Completed
+    }
+
+    /** True when [taken] still matches [recipe] and crafts exactly [expected]. */
+    private fun craftsAsPlanned(
+        recipe: net.minecraft.world.item.crafting.CraftingRecipe,
+        taken: Array<ItemStack?>,
+        expected: ItemStack,
+        lvl: ServerLevel,
+    ): Boolean = try {
+        val input = CraftingInput.of(3, 3, taken.map { it ?: ItemStack.EMPTY })
+        recipe.matches(input, lvl) && recipe.assemble(input).let {
+            it.count == expected.count && ItemStack.isSameItemSameComponents(it, expected)
+        }
+    } catch (e: Exception) {
+        false
+    }
+
+    /** One [itemId] out of the buffer as a real stack, paired with true when it is a fresh
+     *  copy. The plain bucket goes first, then, with [allowWorn], a copy that differs only by
+     *  wear, so a worn crystal back in storage still crafts. A renamed or enchanted copy is
+     *  never used up. */
+    private fun takeIngredient(itemId: String, allowWorn: Boolean): Pair<ItemStack, Boolean>? {
+        takeOne(damien.nodeworks.script.BufferKey.Key(itemId, ""), itemId)?.let { return it to true }
+        if (!allowWorn) return null
+        for ((key, entry) in cpu.bufferState.contents()) {
+            if (key.itemId != itemId || key.isPlain) continue
+            val patch = entry.template.componentsPatch
+            if (patch.size() == 0 || !patch.entrySet().all { it.key == net.minecraft.core.component.DataComponents.DAMAGE }) continue
+            takeOne(key, itemId)?.let { return it to false }
+        }
+        return null
+    }
+
+    /** One item out of [key]'s bucket as a real stack. Built before removing, so an item that
+     *  can't be rebuilt is never taken. */
+    private fun takeOne(key: damien.nodeworks.script.BufferKey.Key, itemId: String): ItemStack? {
+        if (cpu.getBufferCount(key) <= 0L) return null
+        val stack = cpu.getBufferTemplate(key)?.takeIf { !it.isEmpty }?.copyWithCount(1)
+            ?: Identifier.tryParse(itemId)?.let { BuiltInRegistries.ITEM.getValue(it) }?.let { ItemStack(it, 1) }
+            ?: return null
+        if (cpu.removeFromBuffer(key, 1L) < 1L) return null
+        return stack
+    }
+
+    /** True when both grids hold the same item, components and count in every slot. */
+    private fun sameStacks(a: List<ItemStack?>, b: Array<ItemStack?>): Boolean {
+        if (a.size != b.size) return false
+        for (i in b.indices) {
+            val x = a[i]
+            val y = b[i]
+            if (x == null || y == null) {
+                if (x != null || y != null) return false
+                continue
+            }
+            if (x.count != y.count || !ItemStack.isSameItemSameComponents(x, y)) return false
+        }
+        return true
     }
 
     // =====================================================================
@@ -398,15 +549,21 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         } else {
             // Parallel: one handler invocation handles the whole demand. Scale each
             // slot's declared count by the number of batches needed to satisfy the
-            // total output, preserving slot order + duplicates.
-            val perBatchInputs = apiMatch.api.inputs.map { it.itemId to (it.count.toLong() * batches) }
+            // total output, preserving slot order + duplicates. Once the op runs in chunks,
+            // only the next chunk is scaled.
+            val chunk = cpu.opChunkProgress[op.id]
+            val batchesLeft = if (chunk != null) {
+                val left = (chunk.total - chunk.done).coerceAtLeast(1L)
+                if (chunk.fit > 0L) minOf(left, chunk.fit) else left
+            } else batches
+            val perBatchInputs = apiMatch.api.inputs.map { it.itemId to (it.count.toLong() * batchesLeft) }
             BatchProgress(
                 totalBatches = 1L,
                 batchesDone = 0L,
                 perBatchInputs = perBatchInputs,
                 outputItemId = outputItemId,
                 outputPerBatch = outputTotal,
-                batches = batches,
+                batches = batchesLeft,
             )
         }
         processBatchProgress[op.id] = progress
@@ -430,14 +587,10 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
                     return CraftScheduler.OpResult.Failed("Processing handler failed: ${op.processingApiName}")
                 }
                 // One batch done. Advance progress, if more batches remain, start the next one.
-                val progress = processBatchProgress[op.id]
-                if (progress != null) {
-                    progress.batchesDone++
-                    if (progress.batchesDone >= progress.totalBatches) {
-                        processRetries.remove(op.id)
-                        processBatchProgress.remove(op.id)
-                        return CraftScheduler.OpResult.Completed
-                    }
+                if (finishBatch(op, processBatchProgress[op.id])) {
+                    processRetries.remove(op.id)
+                    processBatchProgress.remove(op.id)
+                    return CraftScheduler.OpResult.Completed
                 }
                 // Fall through to start the next batch invocation below.
             } else {
@@ -588,7 +741,57 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         val perBatchInputMap = progress.perBatchInputs
             .groupBy { it.first }
             .mapValues { (_, pairs) -> pairs.sumOf { it.second } }
-        return invokeHandlerAndAnalyze(op, state, perBatchInputMap, apiMatch.api.name, apiMatch.api.outputsAsPairs)
+        if (apiMatch.api.serial) {
+            val result = invokeHandlerAndAnalyze(op, state, perBatchInputMap, apiMatch.api.name, apiMatch.api.outputsAsPairs)
+            // Outputs already waiting finish the batch on the spot, that is one batch, not the op.
+            if (result !is CraftScheduler.OpResult.Completed) return result
+            if (!finishBatch(op, progress)) return CraftScheduler.OpResult.InProgress
+            processRetries.remove(op.id)
+            processBatchProgress.remove(op.id)
+            return result
+        }
+        return invokeLuaChunk(op, state, perBatchInputMap, apiMatch, progress)
+    }
+
+    /** Parallel Lua-handler call for the next chunk of the op's batches. A handler can't be
+     *  probed, so when it moves nothing the next try halves the chunk without using up a
+     *  retry, and after a chunk that worked the next one tries double, so a machine that was
+     *  only briefly busy gets back to full size. Everything fitting in one go behaves exactly
+     *  as before. */
+    private fun invokeLuaChunk(
+        op: Operation.Process,
+        state: ProcessState,
+        declaredInputs: Map<String, Long>,
+        apiMatch: damien.nodeworks.network.ProcessingApiMatch,
+        progress: BatchProgress,
+    ): CraftScheduler.OpResult {
+        val chunk = cpu.opChunkProgress[op.id]
+            ?: damien.nodeworks.block.entity.CraftingCoreBlockEntity.ChunkProgress(progress.batches, 0L, 0L)
+        val tried = progress.batches
+        val pre = declaredInputs.mapValues { (id, _) -> cpu.getBufferCount(id) }
+        val retriesBefore = processRetries[op.id]
+        val result = invokeHandlerAndAnalyze(op, state, declaredInputs, apiMatch.api.name, apiMatch.api.outputsAsPairs)
+        val grown = if (tried > Long.MAX_VALUE / 2L) tried else tried * 2L
+        if (processState[op.id] === state) {
+            cpu.setChunkProgress(op.id, chunk.copy(inFlight = tried, fit = grown))
+            return result
+        }
+        if (result is CraftScheduler.OpResult.Completed) {
+            cpu.setChunkProgress(op.id, chunk.copy(inFlight = tried, fit = grown))
+            if (!finishBatch(op, progress)) return CraftScheduler.OpResult.InProgress
+            processRetries.remove(op.id)
+            processBatchProgress.remove(op.id)
+            return result
+        }
+        // A retry that left the buffer untouched, so a smaller chunk is safe to try.
+        val untouched = declaredInputs.keys.all { cpu.getBufferCount(it) == pre[it] }
+        if (result is CraftScheduler.OpResult.InProgress && tried > 1L && untouched) {
+            cpu.setChunkProgress(op.id, chunk.copy(fit = tried / 2L))
+            // Rebuilt on the next dispatch at the smaller size.
+            processBatchProgress.remove(op.id)
+            if (retriesBefore == null) processRetries.remove(op.id) else processRetries[op.id] = retriesBefore
+        }
+        return result
     }
 
     /**
@@ -639,13 +842,17 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         var allConsumed = true
         var anyConsumed = false
         var stranded: String? = null
+        var unmoved: String? = null
         for ((id, required) in declaredInputs) {
             val preCount = pre[id] ?: 0L
             val now = cpu.getBufferCount(id)
             val consumed = preCount - now  // items that actually left the buffer
             when {
-                consumed == required -> anyConsumed = true
-                consumed == 0L -> allConsumed = false
+                consumed == required -> if (required > 0L) anyConsumed = true
+                consumed == 0L -> {
+                    allConsumed = false
+                    if (unmoved == null) unmoved = id
+                }
                 else -> { // partial move for this input
                     stranded = id
                     allConsumed = false
@@ -658,6 +865,15 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             cancelInvocationPulls(state)
             return CraftScheduler.OpResult.Failed(
                 "Handler '$apiName' partially consumed input '$stranded', " +
+                "all inputs must move together (use :hasSpaceFor or restructure the handler)."
+            )
+        }
+        if (anyConsumed && !allConsumed) {
+            // Some inputs moved and others didn't. A retry can't recover, the moved ones
+            // already left the buffer.
+            cancelInvocationPulls(state)
+            return CraftScheduler.OpResult.Failed(
+                "Handler '$apiName' moved some inputs but not '$unmoved', " +
                 "all inputs must move together (use :hasSpaceFor or restructure the handler)."
             )
         }
@@ -730,25 +946,22 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             return CraftScheduler.OpResult.InProgress
         }
 
-        // Same scaling as the Lua-handler path: full recipe outputs scaled by
-        // [progress.batches], not [progress.totalBatches].
-        val bulkOutputOverride: List<Pair<damien.nodeworks.script.RecipeIngredient, Long>>? = if (!apiMatch.api.serial) {
-            apiMatch.api.outputs.map { ingr ->
-                ingr to (ingr.count.toLong() * progress.batches)
-            }
-        } else null
-
         cpu.setCrafting(true, outputItemId.substringAfter(':').replace('_', ' '))
 
-        val invokeResult = BlockProcessingHandler.invoke(
-            cpu = cpu,
-            level = lvl,
-            api = apiMatch.api,
-            handlerBE = handlerBE,
-            perBatchInputs = progress.perBatchInputs,
-            bulkOutputOverride = bulkOutputOverride,
-            opId = op.id,
-        )
+        // Serial runs one batch per call. Parallel runs chunks sized to what the machine takes.
+        val invokeResult = if (apiMatch.api.serial) {
+            BlockProcessingHandler.invoke(
+                cpu = cpu,
+                level = lvl,
+                api = apiMatch.api,
+                handlerBE = handlerBE,
+                perBatchInputs = progress.perBatchInputs,
+                bulkOutputOverride = null,
+                opId = op.id,
+            )
+        } else {
+            invokeChunk(op, lvl, apiMatch, handlerBE, progress)
+        }
         return when (invokeResult) {
             is BlockProcessingHandler.InvokeResult.InProgress -> {
                 val state = ProcessState(
@@ -764,8 +977,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             is BlockProcessingHandler.InvokeResult.CompletedSync -> {
                 if (invokeResult.pending.success) {
                     // One batch done. Match the Lua path's batch advancement.
-                    progress.batchesDone++
-                    if (progress.batchesDone >= progress.totalBatches) {
+                    if (finishBatch(op, progress)) {
                         processRetries.remove(op.id)
                         processBatchProgress.remove(op.id)
                         CraftScheduler.OpResult.Completed
@@ -791,6 +1003,65 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         }
     }
 
+
+    /** Parallel block-handler call for as many of the op's remaining batches as the machine
+     *  takes right now, so a request bigger than the machine's slots runs in chunks instead
+     *  of retrying until it fails. The chunk is sized by a simulate-only probe and the handler
+     *  is called once, exactly as before when everything fits. When not even one batch fits
+     *  nothing is moved and it counts as a retry. */
+    private fun invokeChunk(
+        op: Operation.Process,
+        lvl: ServerLevel,
+        apiMatch: damien.nodeworks.network.ProcessingApiMatch,
+        handlerBE: damien.nodeworks.block.entity.ProcessingHandlerBlockEntity,
+        progress: BatchProgress,
+    ): BlockProcessingHandler.InvokeResult {
+        val chunk = cpu.opChunkProgress[op.id]
+            ?: damien.nodeworks.block.entity.CraftingCoreBlockEntity.ChunkProgress(progress.batches, 0L, 0L)
+        val left = (chunk.total - chunk.done).coerceAtLeast(1L)
+        val remaining = if (chunk.fit > 0L) minOf(left, chunk.fit) else left
+        val batches = BlockProcessingHandler.fittingBatches(apiMatch.api, handlerBE, remaining)
+        if (batches <= 0L) {
+            return BlockProcessingHandler.InvokeResult.Retry("the machine has no room for even one batch of '${apiMatch.api.name}'")
+        }
+        val result = BlockProcessingHandler.invoke(
+            cpu = cpu,
+            level = lvl,
+            api = apiMatch.api,
+            handlerBE = handlerBE,
+            perBatchInputs = apiMatch.api.inputs.map { it.itemId to it.count.toLong() * batches },
+            bulkOutputOverride = apiMatch.api.outputs.map { it to it.count.toLong() * batches },
+            opId = op.id,
+        )
+        if (result is BlockProcessingHandler.InvokeResult.InProgress || result is BlockProcessingHandler.InvokeResult.CompletedSync) {
+            cpu.setChunkProgress(op.id, chunk.copy(inFlight = batches))
+        } else if (result is BlockProcessingHandler.InvokeResult.Retry && batches > 1L) {
+            // The probe read high, e.g. two inputs sharing one inventory. Cap the next try lower.
+            cpu.setChunkProgress(op.id, chunk.copy(fit = batches / 2L))
+        }
+        return result
+    }
+
+    /** Count a handler call that just finished, true when the op is done. A chunked op adds
+     *  its in-flight chunk and is done once every batch has run, otherwise its progress is
+     *  dropped so the next dispatch rebuilds it and sends the next chunk. */
+    private fun finishBatch(op: Operation.Process, progress: BatchProgress?): Boolean {
+        val chunk = cpu.opChunkProgress[op.id]
+        if (chunk != null && chunk.inFlight > 0L) {
+            val done = chunk.done + chunk.inFlight
+            if (done >= chunk.total) {
+                cpu.clearChunkProgress(op.id)
+                return true
+            }
+            cpu.setChunkProgress(op.id, chunk.copy(done = done, inFlight = 0L))
+            processBatchProgress.remove(op.id)
+            processRetries.remove(op.id)
+            return false
+        }
+        if (progress == null) return false
+        progress.batchesDone++
+        return progress.batchesDone >= progress.totalBatches
+    }
 
     /**
      * Resume an in-flight Process op after world reload. The handler's items survived the
@@ -853,6 +1124,10 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // we ticked), don't bother stashing state, collapse straight to Completed/Failed.
         if (pending.isComplete) {
             return if (pending.success) {
+                // A chunked op still has chunks to run after the one that was in flight.
+                if (cpu.opChunkProgress[op.id] != null) {
+                    if (!finishBatch(op, processBatchProgress[op.id])) return CraftScheduler.OpResult.InProgress
+                }
                 processBatchProgress[op.id]?.let { it.batchesDone = it.totalBatches }
                 CraftScheduler.OpResult.Completed
             } else {
@@ -939,6 +1214,10 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
     // =====================================================================
     // Lifecycle
     // =====================================================================
+
+    override fun onPlanStarted(plan: CraftPlan) {
+        cpu.clearOpState()
+    }
 
     override fun onPlanCompleted(plan: CraftPlan) {
         // Defensive: should be empty by now (each op cleans on completion), but a stuck

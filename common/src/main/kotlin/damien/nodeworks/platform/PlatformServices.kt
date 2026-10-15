@@ -134,8 +134,16 @@ interface StorageService {
     /** Get a fluid storage handle for a block at [pos] accessed from [face]. Returns null if not available or unsupported on this platform. */
     fun getFluidStorage(level: ServerLevel, pos: BlockPos, face: Direction): FluidStorageHandle? = null
 
-    /** Move items between storages. Returns number moved. */
-    fun moveItems(source: ItemStorageHandle, dest: ItemStorageHandle, filter: (String) -> Boolean, maxCount: Long): Long
+    /** Move items between storages. Returns number moved. With a [cursor], a slot-based
+     *  source is scanned from where the last call stopped and wraps at the end, so a huge
+     *  source is covered over several calls instead of restarting at its first slot. */
+    fun moveItems(
+        source: ItemStorageHandle,
+        dest: ItemStorageHandle,
+        filter: (String) -> Boolean,
+        maxCount: Long,
+        cursor: ScanCursor? = null,
+    ): Long
 
     /** Move items with data-aware filter. Filter receives (itemId, hasData). */
     fun moveItemsVariant(source: ItemStorageHandle, dest: ItemStorageHandle, filter: (String, Boolean) -> Boolean, maxCount: Long): Long {
@@ -306,6 +314,11 @@ interface StorageService {
         dest: ItemStorageHandle,
         filter: (ItemStack) -> Boolean,
         maxCount: Long,
+        /** Stop after this many distinct items. Fullness checks pass a small cap so a
+         *  source full of unique items doesn't cost one simulated insert per item. A capped
+         *  run that stops early can't rule the move out, so it skips the simulation and
+         *  reports null [MovePreview.fits]. */
+        maxStacks: Int = Int.MAX_VALUE,
     ): MovePreview? = null
 
     /**
@@ -379,10 +392,25 @@ data class ItemInfo(
     val stackable: Boolean get() = maxStackSize > 1
 }
 
+/** Where a resumable [StorageService.moveItems] scan picks up next. Only a hint, a slot
+ *  past the end of the source starts again at the first slot. */
+class ScanCursor {
+    var slot: Int = 0
+
+    /** For a source with no slots (ME), the item type the last call stopped on. The next
+     *  call starts there, or from the top when it is gone. */
+    var key: Any? = null
+
+    /** True when [key] already had its full turn (the call ran out of time, not items), so
+     *  the next call starts after it and a slow type can't hold the scan in place. */
+    var keyDone: Boolean = false
+}
+
 /** Result of [StorageService.previewMove]. [available] is how many matching items the
  *  source holds, up to the asked amount. [fits] is how many of those the destination
- *  would accept, null when the destination can't simulate. */
-data class MovePreview(val available: Long, val fits: Long?)
+ *  would accept, null when the destination can't simulate. [sawAll] is true when the
+ *  dry run saw every matching item in the source. */
+data class MovePreview(val available: Long, val fits: Long?, val sawAll: Boolean)
 
 /** Metadata for a fluid found in storage. Counts are in millibuckets. */
 data class FluidInfo(
