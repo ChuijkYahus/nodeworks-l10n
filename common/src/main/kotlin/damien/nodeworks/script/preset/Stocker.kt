@@ -271,8 +271,10 @@ class StockerBuilder(
         is CardRef.Named -> {
             val card = resolvedTarget as? ResolvedRef.Card
             val destStorage = card?.let { CardStorage.forCard(level, it.snapshot, it.faceOverride) }
-            if (destStorage == null || !CardStorage.hasRoom(source, destStorage, filterPred, maxCount)) 0L
-            else PlatformServices.storage.moveItems(source, destStorage, filterPred, maxCount)
+            // A Storage Card target only takes what its own rules allow.
+            val accept = card?.let { CardStorage.acceptFilter(level, it.snapshot) }
+            if (destStorage == null || !CardStorage.hasRoom(source, destStorage, filterPred, maxCount, accept)) 0L
+            else PlatformServices.storage.moveItems(source, destStorage, filterPred, maxCount, accept = accept)
         }
         is CardRef.Pool -> NetworkStorageHelper.insertItems(
             level, snapshot, source, filter,
@@ -322,9 +324,10 @@ class StockerBuilder(
             return totalMoved
         }
 
-        // Card target.
+        // Card target. A Storage Card only takes what its own rules allow.
         val card = resolvedTarget as? ResolvedRef.Card ?: return 0L
         val destStorage = CardStorage.forCard(level, card.snapshot, card.faceOverride) ?: return 0L
+        val accept = CardStorage.acceptFilter(level, card.snapshot)
         val cache = engine.inventoryCache
         var remaining = maxCount
         var totalMoved = 0L
@@ -343,7 +346,8 @@ class StockerBuilder(
                     storage, destStorage,
                     { stack ->
                         val sid = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
-                        sid == info.itemId && damien.nodeworks.script.BufferKey.componentsHash(stack) == wantHash
+                        sid == info.itemId && damien.nodeworks.script.BufferKey.componentsHash(stack) == wantHash &&
+                            (accept == null || accept(stack))
                     },
                     remaining,
                 )
