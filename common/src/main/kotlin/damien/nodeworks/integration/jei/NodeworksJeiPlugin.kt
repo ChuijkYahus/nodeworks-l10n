@@ -419,6 +419,9 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
             }
 
             val outputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.OUTPUT)
+            // The mod's recipe object says which outputs are chance-based, JEI itself doesn't.
+            val shown = (0 until ProcessingSetScreenHandler.OUTPUT_SLOTS).map { extractStackAndCount(outputSlots.getOrNull(it)).first }
+            val chance = ChanceOutputs.detect(recipe, shown)
             for (index in 0 until ProcessingSetScreenHandler.OUTPUT_SLOTS) {
                 val (stack, count) = extractStackAndCount(outputSlots.getOrNull(index))
                 PlatformServices.clientNetworking.sendToServer(
@@ -431,6 +434,20 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
                 PlatformServices.clientNetworking.sendToServer(
                     SetProcessingApiDataPayload(container.containerId, "output", index, count)
                 )
+            }
+            // Marks go after every slot payload, so the server judges them against the whole
+            // grid, and never leave a set with no guaranteed output.
+            val marks = BooleanArray(ProcessingSetScreenHandler.OUTPUT_SLOTS) { chance[it] && !shown[it].isEmpty }
+            if (shown.indices.none { !shown[it].isEmpty && !marks[it] }) {
+                shown.indices.firstOrNull { !shown[it].isEmpty }?.let { marks[it] = false }
+            }
+            for (index in 0 until ProcessingSetScreenHandler.OUTPUT_SLOTS) {
+                container.outputOptional[index] = marks[index]
+                if (marks[index]) {
+                    PlatformServices.clientNetworking.sendToServer(
+                        SetProcessingApiDataPayload(container.containerId, "optional", index, 1)
+                    )
+                }
             }
         }
         return null
@@ -520,8 +537,11 @@ class ProcessingSetGhostHandler : IGhostIngredientHandler<ProcessingSetScreen> {
             PlatformServices.clientNetworking.sendToServer(
                 SetProcessingApiSlotPayload(gui.menu.containerId, slotIndex, ingredient.copyWithCount(1))
             )
-            // A new item means no tag, as the server will decide too.
+            // A new item means no tag and no optional mark, as the server will decide too.
             if (slotIndex < ProcessingSetScreenHandler.INPUT_SLOTS) gui.menu.inputTags[slotIndex] = null
+            else if (slotIndex < ProcessingSetScreenHandler.TOTAL_GHOST_SLOTS) {
+                gui.menu.outputOptional[slotIndex - ProcessingSetScreenHandler.INPUT_SLOTS] = false
+            }
         }
     }
 }

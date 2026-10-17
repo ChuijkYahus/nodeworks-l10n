@@ -7,6 +7,11 @@ import net.minecraft.server.level.ServerLevel
 import org.luaj.vm2.*
 import org.luaj.vm2.lib.*
 
+/** Shortest a machine must be quiet before a job short on a guaranteed output borrows a
+ *  bonus copy back from storage, see [ProcessingJob.borrowShortfall]. The wait follows the
+ *  machine's own pace and has no ceiling, a slow machine is never judged early. */
+private const val MIN_QUIET_TICKS = 20L
+
 /**
  * Represents a processing job context passed as the first argument to handler functions.
  *
@@ -46,18 +51,86 @@ class ProcessingJob(
         var amount: Long,
     )
 
-    private val remaining: MutableList<OutputState> = run {
-        val src = overrideOutputs ?: api.outputs.map { it to it.count.toLong() }
-        src.map { (ingr, ct) ->
-            OutputState(
-                itemId = ingr.itemId,
-                componentsHash = damien.nodeworks.script.BufferKey.componentsHash(ingr.stack),
-                template = ingr.stack.copyWithCount(1),
-                amount = ct,
-            )
-        }.toMutableList()
+    private val declaredOutputs: List<Pair<RecipeIngredient, Long>> =
+        overrideOutputs ?: api.outputs.map { it to it.count.toLong() }
+
+    private fun stateOf(ingr: RecipeIngredient, ct: Long) = OutputState(
+        itemId = ingr.itemId,
+        componentsHash = damien.nodeworks.script.BufferKey.componentsHash(ingr.stack),
+        template = ingr.stack.copyWithCount(1),
+        amount = ct,
+    )
+
+    /** One state per item on one side, two slots of the same item fold into one so
+     *  neither is left waiting for what the other collected. */
+    private fun merged(optional: Boolean): MutableList<OutputState> {
+        val out = LinkedHashMap<damien.nodeworks.script.BufferKey.Key, OutputState>()
+        for ((ingr, ct) in declaredOutputs) {
+            if (ingr.optional != optional) continue
+            val prev = out[ingr.bufferKey()]
+            if (prev == null) out[ingr.bufferKey()] = stateOf(ingr, ct) else prev.amount += ct
+        }
+        return out.values.toMutableList()
+    }
+
+    /** Guaranteed outputs still to collect. The job completes when this is empty. */
+    private val remaining: MutableList<OutputState> = merged(optional = false)
+
+    /** Outputs the machine only sometimes makes. Taken when present, up to the declared
+     *  count, never waited for, and sent to network storage rather than the CPU buffer so
+     *  the craft is never held up by luck. */
+    private val optional: MutableList<OutputState> = merged(optional = true)
+
+    /** One item the job collects, with its guaranteed and optional sides together. A bonus
+     *  copy of the main output (an 80% chance of a second dust) shares the guaranteed one's
+     *  group, and the two are told apart per poll: the machine makes an operation's outputs
+     *  in one tick, so a poll finding more than the guaranteed count per operation found
+     *  the bonus too. [perOpRequired] and [perOpOptional] are the per-operation counts. */
+    private class Group(
+        val required: OutputState?,
+        val optional: OutputState?,
+        val perOpRequired: Long,
+        val perOpOptional: Long,
+    ) {
+        /** Bonus copies of the guaranteed item already sent to storage. */
+        var optionalSent: Long = 0L
+    }
+
+    private val groups: List<Group> = run {
+        val keys = LinkedHashSet<damien.nodeworks.script.BufferKey.Key>()
+        for ((ingr, _) in declaredOutputs) keys += ingr.bufferKey()
+        keys.map { key ->
+            val match: (OutputState) -> Boolean = { it.itemId == key.itemId && it.componentsHash == key.componentsHash }
+            val perOp: (Boolean) -> Long = { opt ->
+                declaredOutputs.filter { it.first.optional == opt && it.first.bufferKey() == key }.sumOf { it.first.count.toLong() }
+            }
+            Group(remaining.firstOrNull(match), optional.firstOrNull(match), perOp(false), perOp(true))
+        }
     }
     private val startGeneration = cpu.jobGeneration
+
+    /** Last tick anything was collected, guaranteed or optional. Starts at the job's
+     *  start, so the wait for the first output counts as the first gap. */
+    private var lastProgressTick: Long = scheduler.currentTick
+
+    /** Longest gap seen between this machine's outputs, the start to the first output
+     *  included since that is about one operation. Twice this is how long it must be
+     *  quiet before the job treats it as finished, whatever its speed. */
+    private var maxGapTicks: Long = 0L
+
+    /** Last tick a borrow-back was attempted, so a failed one isn't retried every tick. */
+    private var lastBorrowTick: Long = Long.MIN_VALUE
+
+    private val quietTicks: Long get() = maxOf(MIN_QUIET_TICKS, 2L * maxGapTicks)
+
+    private fun noteProgress() {
+        val now = scheduler.currentTick
+        maxGapTicks = maxOf(maxGapTicks, now - lastProgressTick)
+        lastProgressTick = now
+    }
+
+    /** When the pending poll times out, so an optional wait never runs into it. */
+    private var deadlineTick: Long = Long.MAX_VALUE
 
     /** Pulls registered during the most recent handler invocation. The CPU reads this
      *  to cancel them if the handler failed to move its inputs (see
@@ -76,6 +149,7 @@ class ProcessingJob(
             val entry = LuaTable()
             entry.set("id", ingr.itemId)
             entry.set("count", ingr.count)
+            entry.set("optional", LuaValue.valueOf(ingr.optional))
             outputsTable.set(i + 1, entry)
         }
         table.set("outputs", outputsTable)
@@ -116,19 +190,16 @@ class ProcessingJob(
                 // exact op that was in-flight, the legacy global addPendingOp is still called
                 // for backwards compat with the legacy resume path.
                 cpu.addPendingOp(
-                    api.outputs.map { it.stack.copyWithCount(1) to it.count.toLong() },
+                    api.outputs.filter { !it.optional }.map { it.stack.copyWithCount(1) to it.count.toLong() },
                     pullTargets,
                 )
                 if (opId >= 0) {
-                    cpu.setOpResume(opId, CraftingCoreBlockEntity.OpResumeInfo(
-                        processingApiName = api.name,
-                        outputs = remaining.map { it.template.copyWithCount(1) to it.amount },
-                        pullTargets = pullTargets
-                    ))
+                    cpu.setOpResume(opId, resumeInfo(pullTargets))
                 }
 
                 // Register for polling each tick
                 val timeoutTicks = if (api.timeout > 0) api.timeout.toLong() else 6000L
+                deadlineTick = scheduler.currentTick + timeoutTicks
                 val pending = SchedulerImpl.PendingJob(
                     pollFn = { tryExtract(getters) },
                     timeoutAt = scheduler.currentTick + timeoutTicks,
@@ -150,55 +221,91 @@ class ProcessingJob(
     /**
      * Incremental: each poll grabs whatever's currently available for each declared output
      * and decrements the remaining count. Only returns true (job complete) once every
-     * declared count has been fully collected. For a 4-ingot smelt on a furnace that emits
+     * guaranteed count has been fully collected. For a 4-ingot smelt on a furnace that emits
      * one ingot every few seconds, this means we pull each ingot as it arrives instead of
-     * waiting for all 4 to pile up and blocking subsequent smelts.
+     * waiting for all 4 to pile up and blocking subsequent smelts. Optional outputs found
+     * along the way go to network storage and never hold the job up.
      */
     private fun tryExtract(getters: List<CardHandle.StorageGetter>): Boolean {
         val stale = isStale
-        val snapshot = if (stale) damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, cpu.blockPos) else null
+        var snapshot: damien.nodeworks.network.NetworkSnapshot? =
+            if (stale) damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, cpu.blockPos) else null
+        fun network(): damien.nodeworks.network.NetworkSnapshot =
+            snapshot ?: damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, cpu.blockPos).also { snapshot = it }
 
-        val iter = remaining.listIterator()
-        while (iter.hasNext()) {
-            val out = iter.next()
-            var stillNeeded = out.amount
+        for (group in groups) {
+            val required = group.required?.takeIf { it.amount > 0L }
+            val optional = if (stale) null else group.optional?.takeIf { it.amount > 0L }
+            if (required == null && optional == null) continue
+            val reqLeft = required?.amount ?: 0L
+            val optLeft = optional?.amount ?: 0L
+            val state = required ?: optional!!
             // Variant-aware filter: pull only stacks whose itemId AND
             // componentsHash match the declared output. Without this a
             // poison potion sitting in the output card would satisfy a
             // strength-potion output because both share `minecraft:potion`.
             val stackFilter: (net.minecraft.world.item.ItemStack) -> Boolean = { stack ->
                 val sid = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
-                sid == out.itemId &&
-                    damien.nodeworks.script.BufferKey.componentsHash(stack) == out.componentsHash
+                sid == state.itemId &&
+                    damien.nodeworks.script.BufferKey.componentsHash(stack) == state.componentsHash
             }
+            var want = reqLeft + optLeft
+            val found = ArrayList<Pair<net.minecraft.world.item.ItemStack, damien.nodeworks.platform.ItemStorageHandle>>()
             for (getter in getters) {
-                if (stillNeeded <= 0L) break
+                if (want <= 0L) break
                 val storage = getter.getStorage() ?: continue
-                val extractedStacks = PlatformServices.storage.extractStacksByPredicate(
-                    storage, stackFilter, stillNeeded
-                )
-                for (stack in extractedStacks) {
+                val extracted = try {
+                    PlatformServices.storage.extractStacksByPredicate(storage, stackFilter, want)
+                } catch (_: Exception) { emptyList() }
+                for (stack in extracted) {
                     if (stack.isEmpty) continue
-                    val amount = stack.count.toLong()
+                    want -= stack.count.toLong()
+                    found += stack to storage
+                }
+            }
+            val k = found.sumOf { it.first.count.toLong() }
+            if (k <= 0L) continue
+            noteProgress()
+
+            // Split this poll's haul. Both sides present: the machine finished
+            // ceil(k / perOp) operations this tick, each of which made its guaranteed
+            // count, so that many are guaranteed and the rest are bonuses.
+            val toRequired = when {
+                required == null -> 0L
+                optional == null -> minOf(k, reqLeft)
+                else -> {
+                    val perOp = group.perOpRequired + group.perOpOptional
+                    val ops = (k + perOp - 1) / perOp
+                    minOf(k, ops * group.perOpRequired, reqLeft)
+                }
+            }
+            val toOptional = minOf(k - toRequired, optLeft)
+            // Anything past both counts stays with the craft, the buffer flush returns it.
+            var keep = k - toOptional
+            for ((stack, source) in found) {
+                val amount = stack.count.toLong()
+                val kept = minOf(amount, keep)
+                keep -= kept
+                if (kept > 0L) {
+                    val part = stack.copyWithCount(kept.toInt())
                     if (stale) {
                         // Stale-recovery path: the CPU's job context outlived the
                         // network it was on, so we route the recovered stack back
                         // into the live network as-is (components preserved).
-                        NetworkStorageHelper.insertItemStack(level, snapshot!!, stack, null)
+                        NetworkStorageHelper.insertItemStack(level, network(), part, null)
                     } else {
-                        cpu.addToBuffer(stack, amount)
+                        cpu.addToBuffer(part, kept)
                     }
-                    stillNeeded -= amount
                 }
+                if (amount > kept) routeOptional(stack.copyWithCount((amount - kept).toInt()), network(), source)
             }
-            if (stillNeeded <= 0L) {
-                iter.remove()
-            } else {
-                out.amount = stillNeeded
-            }
+            required?.let { it.amount = reqLeft - toRequired }
+            optional?.let { it.amount = optLeft - toOptional }
+            if (required != null && optional != null) group.optionalSent += toOptional
         }
+        remaining.removeAll { it.amount <= 0L }
 
-        if (remaining.isEmpty()) {
+        if (remaining.isEmpty() || (!stale && borrowShortfall(::network))) {
             cpu.completePendingOp()
             cpu.clearOpResume(opId)
             return true
@@ -206,11 +313,82 @@ class ProcessingJob(
         // Update per-op resume info so a save mid-stream resumes with the right remaining count.
         if (opId >= 0 && cpu.opResumeInfo[opId] != null) {
             val existing = cpu.opResumeInfo[opId]!!
-            cpu.setOpResume(opId, existing.copy(
-                outputs = remaining.map { it.template.copyWithCount(1) to it.amount }
-            ))
+            cpu.setOpResume(opId, resumeInfo(existing.pullTargets))
         }
         return false
+    }
+
+    /** What a reload needs to carry this job on: every output still outstanding, with its
+     *  per-operation count so a bonus copy of the main output is still told apart. */
+    private fun resumeInfo(
+        pullTargets: List<Pair<net.minecraft.core.BlockPos, net.minecraft.core.Direction>>,
+    ): CraftingCoreBlockEntity.OpResumeInfo {
+        fun perOp(state: OutputState): Int {
+            val group = groups.firstOrNull { it.required === state || it.optional === state } ?: return 1
+            val n = if (group.required === state) group.perOpRequired else group.perOpOptional
+            return n.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+        }
+        return CraftingCoreBlockEntity.OpResumeInfo(
+            processingApiName = api.name,
+            outputs = remaining.map { it.template.copyWithCount(1) to it.amount },
+            pullTargets = pullTargets,
+            outputsPerOp = remaining.map { perOp(it) },
+            optionals = optional.filter { it.amount > 0L }.map {
+                CraftingCoreBlockEntity.ResumeOutput(it.template.copyWithCount(1), it.amount, perOp(it))
+            },
+        )
+    }
+
+    /** Two operations finishing in one tick with no bonus look like one with a bonus, so a
+     *  guaranteed copy can be filed as optional and sent to storage. If that is the only
+     *  thing holding the job up and the machine has gone quiet, take the shortfall back from
+     *  storage into the buffer and finish. True when the job may complete. */
+    private fun borrowShortfall(network: () -> damien.nodeworks.network.NetworkSnapshot): Boolean {
+        val short = groups.filter { (it.required?.amount ?: 0L) > 0L }
+        if (short.isEmpty()) return true
+        if (short.any { it.optionalSent < it.required!!.amount }) return false
+        val now = scheduler.currentTick
+        val quiet = now - lastProgressTick >= quietTicks
+        if (!quiet && now + 1 < deadlineTick) return false
+        // Borrowing walks every storage card, so a failed attempt waits another quiet period.
+        if (now - lastBorrowTick < quietTicks) return false
+        lastBorrowTick = now
+        for (group in short) {
+            val req = group.required!!
+            val stacks = try {
+                NetworkStorageHelper.extractVariantAcrossNetwork(level, network(), req.itemId, req.template.componentsPatch, req.amount)
+            } catch (_: Exception) { emptyList() }
+            for (stack in stacks) {
+                if (stack.isEmpty) continue
+                val n = stack.count.toLong()
+                cpu.addToBuffer(stack, n)
+                req.amount -= n
+                group.optionalSent -= n
+            }
+        }
+        remaining.removeAll { it.amount <= 0L }
+        return remaining.isEmpty()
+    }
+
+    /** Send an optional output to network storage. What storage won't take goes to the CPU
+     *  buffer, and what the buffer won't take goes back into the card it came from, so
+     *  nothing is lost. */
+    private fun routeOptional(
+        stack: net.minecraft.world.item.ItemStack,
+        snapshot: damien.nodeworks.network.NetworkSnapshot,
+        source: damien.nodeworks.platform.ItemStorageHandle,
+    ) {
+        val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, null)
+        val left = stack.count - inserted
+        if (left <= 0) return
+        val rest = stack.copyWithCount(left)
+        if (cpu.addToBuffer(rest, left.toLong())) return
+        val back = try { PlatformServices.storage.insertItemStack(source, rest) } catch (_: Exception) { 0 }
+        if (back < left) {
+            net.minecraft.world.Containers.dropItemStack(
+                level, cpu.blockPos.x + 0.5, cpu.blockPos.y + 1.0, cpu.blockPos.z + 0.5, rest.copyWithCount(left - back),
+            )
+        }
     }
 
     /**
@@ -232,18 +410,15 @@ class ProcessingJob(
         }
         if (pullTargets.isNotEmpty()) {
             cpu.addPendingOp(
-                api.outputs.map { it.stack.copyWithCount(1) to it.count.toLong() },
+                api.outputs.filter { !it.optional }.map { it.stack.copyWithCount(1) to it.count.toLong() },
                 pullTargets,
             )
             if (opId >= 0) {
-                cpu.setOpResume(opId, CraftingCoreBlockEntity.OpResumeInfo(
-                    processingApiName = api.name,
-                    outputs = remaining.map { it.template.copyWithCount(1) to it.amount },
-                    pullTargets = pullTargets,
-                ))
+                cpu.setOpResume(opId, resumeInfo(pullTargets))
             }
         }
         val timeoutTicks = if (api.timeout > 0) api.timeout.toLong() else 6000L
+        deadlineTick = scheduler.currentTick + timeoutTicks
         scheduler.addPendingJob(SchedulerImpl.PendingJob(
             pollFn = { tryExtract(getters) },
             timeoutAt = scheduler.currentTick + timeoutTicks,

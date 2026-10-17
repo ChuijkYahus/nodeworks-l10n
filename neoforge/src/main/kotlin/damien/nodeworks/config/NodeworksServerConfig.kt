@@ -34,6 +34,7 @@ object NodeworksServerConfig {
     val MAX_CALLBACKS_PER_KIND: ModConfigSpec.IntValue
     val ENABLED_MODULES: ModConfigSpec.ConfigValue<List<String>>
     val DISABLED_METHODS: ModConfigSpec.ConfigValue<List<String>>
+    val OBSERVER_DENIED_BLOCKS: ModConfigSpec.ConfigValue<List<String>>
     val USER_DENIED_ITEMS: ModConfigSpec.ConfigValue<List<String>>
     val NETWORK_CONTROLLER_CHUNK_LOADING: ModConfigSpec.BooleanValue
     val GRAPPLE_MAX_DISTANCE: ModConfigSpec.IntValue
@@ -343,7 +344,7 @@ object NodeworksServerConfig {
                 "   Scheduler          global scheduler table (scheduler:tick, second, delay, cancel)",
                 "   CardHandle         storage card methods (insert, tryInsert, find, findEach, count, face, slots)",
                 "   RedstoneCard       redstone card methods (powered, strength, set, onChange)",
-                "   ObserverCard       observer card methods (block, state, onChange)",
+                "   ObserverCard       observer card methods (block, state, data, energy, onChange)",
                 "   VariableHandle     variable card methods (get, set, cas, increment, decrement, etc.)",
                 "   PlacerHandle       placer methods (place, block, isBlocked)",
                 "   BreakerHandle      breaker methods (mine, cancel, block, state, isMining, progress)",
@@ -357,6 +358,22 @@ object NodeworksServerConfig {
                 "disabledMethods",
                 ServerSafetySettings.Defaults.disabledMethods.toList(),
                 { "Network:insert" },
+            ) { it is String }
+
+        OBSERVER_DENIED_BLOCKS = builder
+            .comment(
+                " Blocks whose data `ObserverCard:data()` won't read, for blocks you",
+                " don't want scripts to see the internals of. Bare ids match exactly,",
+                " entries starting with `#` match a block tag. Reading a listed block",
+                " throws an error in the script. To turn off `data()` everywhere,",
+                " add \"ObserverCard:data\" to disabledMethods instead.",
+                " Example: [\"nodeworks:terminal\", \"#c:chests\"]",
+                " Empty list = no restrictions."
+            )
+            .defineListAllowEmpty(
+                "observerDeniedBlocks",
+                ServerSafetySettings.Defaults.observerDeniedBlocks,
+                { "minecraft:chest" },
             ) { it is String }
 
         builder.pop()
@@ -445,6 +462,7 @@ object NodeworksServerConfig {
         maxCallbacksPerKind = MAX_CALLBACKS_PER_KIND.get(),
         enabledModules = ENABLED_MODULES.get().toSet(),
         disabledMethods = DISABLED_METHODS.get().toSet(),
+        observerDeniedBlocks = OBSERVER_DENIED_BLOCKS.get().toList(),
         userDeniedItems = USER_DENIED_ITEMS.get().toList(),
         networkControllerChunkLoading = NETWORK_CONTROLLER_CHUNK_LOADING.get(),
         grappleMaxDistance = GRAPPLE_MAX_DISTANCE.get(),
