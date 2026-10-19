@@ -587,7 +587,18 @@ class CraftingCoreBlockEntity(
                 val neighbor = pos.relative(dir)
                 if (neighbor in visited) continue
                 visited.add(neighbor)
-                val entity = level?.getBlockEntity(neighbor) ?: continue
+                val entity = level?.getBlockEntity(neighbor)
+                if (entity !is CraftingCoreBlockEntity && entity !is CpuComponentBlockEntity) {
+                    // Connecting coolant carries the structure without contributing to it,
+                    // whether or not the block has an entity of its own. Its cooling is
+                    // still counted by the adjacency pass below.
+                    val lvl = level
+                    if (lvl != null && CpuComponentBlockEntity.connectsThrough(lvl, neighbor)) {
+                        queue.add(neighbor)
+                        discovered++
+                    }
+                    continue
+                }
                 if (entity is CraftingCoreBlockEntity) {
                     // Reached through a component, so it shares our structure. Two Cores
                     // touching face to face with no component between them stay separate.
