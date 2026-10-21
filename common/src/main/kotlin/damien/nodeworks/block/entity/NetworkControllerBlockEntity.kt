@@ -192,6 +192,9 @@ class NetworkControllerBlockEntity(
             if (blockDestroyed && chunkLoadingEnabled) {
                 releaseAllClaims(lvl)
             }
+            // The neighbours revalidate next tick with this block gone. Without this they
+            // would read the id they still carry as a controller that is merely unloaded.
+            if (blockDestroyed) damien.nodeworks.network.NetworkIds.retireController(permanentId)
             NodeConnectionHelper.removeAllConnections(lvl, this)
             NodeConnectionHelper.untrackNode(lvl, worldPosition)
             // Key on permanentId since networkId is null mid-conflict.
@@ -468,7 +471,7 @@ class NetworkControllerBlockEntity(
         )
         // Invalidate the chunk tint cache when membership flipped to/from null but
         // colour settings stayed identical, [update] above doesn't fire onChanged then.
-        damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
+        if (level != null) damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(worldPosition)
     }
 
     override fun getUpdateTag(registries: HolderLookup.Provider): CompoundTag {

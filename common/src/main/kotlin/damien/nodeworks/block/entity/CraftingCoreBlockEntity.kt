@@ -56,8 +56,10 @@ class CraftingCoreBlockEntity(
             //  needs its blockstate re-pushed. recalculateCapacity() walks the
             //  cluster and calls setBlock only where the desired state differs,
             //  so this is cheap when nothing changed.
+            // Deferred to the tick so the scan's network walk runs after propagation
+            // has finished assigning ids, never in the middle of it.
             if (changed && level != null && !level!!.isClientSide) {
-                recalculateCapacity()
+                requestRecalculate()
             }
         }
 
@@ -446,6 +448,19 @@ class CraftingCoreBlockEntity(
         return true
     }
 
+    /** Puts [count] of [stack] in the buffer whatever its capacity, and tells the player
+     *  why. For a job's outputs that are already out of the machine and have nowhere
+     *  else to go. The buffer is over its limit until a Deliver or the plan's end drains
+     *  it, and the craft carries on. */
+    fun addToBufferForced(stack: net.minecraft.world.item.ItemStack, count: Long, networkFull: Boolean) {
+        bufferState.insertForced(stack, count)
+        lastFailureReason = if (networkFull)
+            "Buffer over capacity and the network has no space for outputs. Holding them until storage frees up."
+        else
+            "Buffer over capacity. Holding outputs until space frees up."
+        setChanged()
+    }
+
     /** Component-aware buffer insertion. Use this when the caller has a real
      *  [ItemStack] (e.g. just pulled from storage) so durability / potion
      *  contents / dye colour / enchantments live in the buffer template
@@ -720,11 +735,15 @@ class CraftingCoreBlockEntity(
         }
         val totalCooled = totalCooledFloat.toInt()
 
-        // "Formed" now also requires an active network membership, disconnecting the
-        //  Core from the laser network flips this false, which drives every cluster
-        //  block to swap its emissive-on model for the plain one.
+        // Formed also requires a Network Controller on the network. A Node-anchored
+        // network has an id without one, and autocrafting stays a controller feature,
+        // so the check asks the network rather than the id. Losing the controller
+        // flips this false, which swaps every cluster block to its plain model.
         drivenBy = resolveDriver(rivals)
-        isFormed = drivenBy == null && bufferCount > 0 && networkId != null
+        val serverLevel = level as? ServerLevel
+        val hasController = networkId != null && serverLevel != null &&
+            damien.nodeworks.network.NetworkDiscovery.discoverNetwork(serverLevel, worldPosition).hasController
+        isFormed = drivenBy == null && bufferCount > 0 && hasController
         coProcessorCount = coProcessors
         heatGenerated = totalHeat
         heatCooled = totalCooled
@@ -1158,7 +1177,7 @@ class CraftingCoreBlockEntity(
         networkId = input.getStringOrNull("networkId")?.takeIf { it.isNotEmpty() }?.let {
             try { UUID.fromString(it) } catch (_: Exception) { null }
         }
-        damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
+        if (level != null) damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(worldPosition)
 
         // [level] isn't set yet during loadAdditional (Vanilla calls
         // [setLevel] AFTER load), but [ValueInput.lookup] carries the

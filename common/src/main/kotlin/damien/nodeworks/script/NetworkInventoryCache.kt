@@ -32,9 +32,18 @@ class NetworkInventoryCache(
      *  Mirroring [init]'s scan here populates the cache before the caller returns. */
     fun rebindEntryPoint(pos: BlockPos) {
         if (networkEntryNode == pos) return
+        // Only an entry that is gone has left this cache polling nothing, so only then is
+        // a synchronous rescan worth its cost. Two live consumers taking turns to reseat
+        // the entry, two terminals or a terminal and a monitor, must not each force one.
+        val old = networkEntryNode
+        val oldGone = level.isLoaded(old) &&
+            damien.nodeworks.network.NodeConnectionHelper.getConnectable(level, old) == null
         networkEntryNode = pos
-        fullScan()
+        if (oldGone) fullScan()
     }
+
+    /** Consecutive orphan checks that found the entry point gone, see [isOrphan]. */
+    private var deadEntryChecks = 0
 
     /** Synchronous scan of every card, then restart the poll cycle. A cycle left
      *  running would keep adding its remaining units into the front buffer this
@@ -199,6 +208,23 @@ class NetworkInventoryCache(
     private fun isDirty(key: BufferKey.Key) = key in dirtyKeys || key in lastDirtyKeys
     private fun isDirtyFluid(key: String) = key in dirtyFluidKeys || key in lastDirtyFluidKeys
 
+    /** True when the network reachable from the entry point no longer carries [key],
+     *  the id this cache is registered under. That happens when a controller-less
+     *  network's anchoring Node is replaced, two networks merge, or a controller is
+     *  added. Unknown while the entry point is unloaded, which counts as not orphaned. */
+    fun isOrphan(key: String): Boolean {
+        if (!level.isLoaded(networkEntryNode)) return false
+        if (damien.nodeworks.network.NodeConnectionHelper.getConnectable(level, networkEntryNode) == null) {
+            // The entry block is gone. A consumer that still reads this cache reseats the
+            // entry within a second, so only a cache nobody reseats for a while is abandoned.
+            return ++deadEntryChecks >= 3
+        }
+        deadEntryChecks = 0
+        val snapshot = damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, networkEntryNode)
+        val current = snapshot.networkId?.toString() ?: "${level.dimension().toString()}:${networkEntryNode.asLong()}"
+        return current != key
+    }
+
     companion object {
         // Slices per cycle, controls how many ticks one full poll spans.
         // MIN = active cycle (5 ticks per cycle, scan ~1/5 of cards each tick).
@@ -251,6 +277,44 @@ class NetworkInventoryCache(
 
         fun removeByUUID(uuid: java.util.UUID) {
             caches.remove(uuid.toString())
+        }
+
+        /** Carries a network's cache over to its new id. When both ids already have one,
+         *  two networks merged, the one under [next] stays and the other is dropped, its
+         *  terminals rebind to the survivor on their next check. */
+        fun renameKey(previous: java.util.UUID, next: java.util.UUID) {
+            if (previous == next) return
+            val moved = caches.remove(previous.toString()) ?: return
+            caches.putIfAbsent(next.toString(), moved)
+        }
+
+        /** The cache a network already has, or null. Never creates one, so a device that
+         *  only wants to keep an open terminal current does not start a poller on a
+         *  network nobody is looking at. */
+        fun existing(level: ServerLevel, networkEntryNode: BlockPos): NetworkInventoryCache? {
+            val id = damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, networkEntryNode).networkId ?: return null
+            return caches[id.toString()]
+        }
+
+        /** The same by id, for a caller that already holds a snapshot and should not walk again. */
+        fun existing(networkId: java.util.UUID?): NetworkInventoryCache? =
+            networkId?.let { caches[it.toString()] }
+
+        private const val ORPHAN_CHECK_TICKS = 200L
+
+        /** Drops caches whose network now lives under another id. Nothing else removes
+         *  them and each would poll forever. A consumer still holding one re-resolves
+         *  through [getOrCreate] on its next connection check. One network walk per
+         *  cache every ten seconds, served from the per-tick discovery cache. */
+        fun evictOrphans(gameTime: Long) {
+            // Each cache takes its turn on its own tick, so many networks never walk together.
+            val phase = gameTime % ORPHAN_CHECK_TICKS
+            val it = caches.entries.iterator()
+            while (it.hasNext()) {
+                val entry = it.next()
+                if ((entry.key.hashCode().toLong() and 0x7FFFFFFFL) % ORPHAN_CHECK_TICKS != phase) continue
+                if (entry.value.isOrphan(entry.key)) it.remove()
+            }
         }
 
         fun remove(level: ServerLevel, networkEntryNode: BlockPos) {
@@ -542,6 +606,10 @@ class NetworkInventoryCache(
         if (stray) logger.debug("Inventory cache at {} ended a cycle with a storage half-read, discarded it", networkEntryNode)
         val snapshot = cycleSnapshot
         if (snapshot != null) {
+            // Without a controller nothing autocrafts, whatever the recipe.
+            val noController = !snapshot.hasController
+            val baseWarning = if (noController) damien.nodeworks.platform.CraftWarning.NO_CONTROLLER
+                else damien.nodeworks.platform.CraftWarning.NONE
             // Phantom craftable entries for recipe outputs not already in storage.
             // Done at cycle end (not per-card) so the phantom logic only runs once.
             for (crafter in snapshot.crafters) {
@@ -549,17 +617,20 @@ class NetworkInventoryCache(
                     val outputId = iset.outputItemId
                     if (outputId.isEmpty()) continue
                     if (iset.outputComponents.isEmpty) {
-                        addCraftablePhantom(outputId)
+                        addCraftablePhantom(outputId, baseWarning)
                         continue
                     }
                     // Shown as the variant the recipe makes, e.g. an oak barrel.
                     val item = net.minecraft.resources.Identifier.tryParse(outputId)
                         ?.let { net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(it) } ?: continue
-                    addCraftablePhantom(ItemStack(item).also { it.applyComponents(iset.outputComponents) })
+                    addCraftablePhantom(ItemStack(item).also { it.applyComponents(iset.outputComponents) }, baseWarning)
                 }
             }
             for (api in snapshot.processingApis) {
                 for (procApi in api.apis) {
+                    val warning = if (noController) baseWarning
+                        else if (hasProcessingHandler(snapshot, api, procApi)) damien.nodeworks.platform.CraftWarning.NONE
+                        else damien.nodeworks.platform.CraftWarning.NO_HANDLER
                     for (output in procApi.outputs) {
                         if (output.itemId.isEmpty()) continue
                         // A chance output can't be crafted on demand, the planner skips it too.
@@ -569,7 +640,7 @@ class NetworkInventoryCache(
                         // enchantments) and renders as the proper variant
                         // in the Inventory Terminal instead of falling back
                         // to "Uncraftable Potion" / blank-glint placeholders.
-                        addCraftablePhantom(output.stack)
+                        addCraftablePhantom(output.stack, warning)
                     }
                 }
             }
@@ -583,10 +654,31 @@ class NetworkInventoryCache(
 
     /** Mark [outputId] as craftable, plain-components variant. Used by
      *  Instruction Set recipes whose output is always a plain itemId. */
-    private fun addCraftablePhantom(outputId: String) {
+    private fun addCraftablePhantom(outputId: String, warning: Byte) {
         val id = net.minecraft.resources.Identifier.tryParse(outputId) ?: return
         val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) ?: return
-        addCraftablePhantom(ItemStack(item))
+        addCraftablePhantom(ItemStack(item), warning)
+    }
+
+    /** Whether something on the network would run the Processing Set [apiName] if a
+     *  craft asked for it: a script handler on one of the terminals, or a Processing
+     *  Handler block bound to it. Resolved the way the CPU resolves it, against the
+     *  provider network for a set that came in over an antenna. Only map lookups, a
+     *  handler block in an unloaded chunk counts by its registration. */
+    private fun hasProcessingHandler(
+        snapshot: NetworkSnapshot,
+        apiStorage: damien.nodeworks.network.ProcessingApiSnapshot,
+        api: damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo,
+    ): Boolean {
+        val apiName = api.name
+        val terminals = apiStorage.remoteTerminalPositions ?: snapshot.terminalPositions
+        if (PlatformServices.modState.findProcessingEngine(level, terminals, apiName, apiStorage.remoteDimension, api) != null) return true
+        val handlerNetworkId = apiStorage.remoteNetworkId ?: snapshot.networkId
+        val pos = damien.nodeworks.script.cpu.BlockHandlerRegistry.find(handlerNetworkId, apiName) ?: return false
+        val handlerLevel = apiStorage.remoteDimension?.let { level.server.getLevel(it) } ?: level
+        if (!handlerLevel.isLoaded(pos)) return true
+        val handler = handlerLevel.getBlockEntity(pos) as? damien.nodeworks.block.entity.ProcessingHandlerBlockEntity
+        return handler != null && handler.handles(apiName)
     }
 
     /** Mark the variant identified by [template] as craftable in the front
@@ -594,13 +686,15 @@ class NetworkInventoryCache(
      *  a phantom 0-count entry. Keyed on the template's component-aware
      *  [BufferKey.Key] so component-bearing recipe outputs (potions, dyed
      *  armor) get distinct phantom rows from plain variants of the same
-     *  itemId. */
-    private fun addCraftablePhantom(template: ItemStack) {
+     *  itemId. An item with several recipes keeps the best [warning] among them, so
+     *  one working recipe clears it. */
+    private fun addCraftablePhantom(template: ItemStack, warning: Byte) {
         if (template.isEmpty) return
         val key = BufferKey.of(template)
         val existing = frontBuffer[key]
         if (existing != null) {
-            frontBuffer[key] = existing.copy(isCraftable = true)
+            val best = if (existing.isCraftable) minOf(existing.craftWarning, warning) else warning
+            frontBuffer[key] = existing.copy(isCraftable = true, craftWarning = best)
         } else {
             frontBuffer[key] = ItemInfo(
                 itemId = key.itemId,
@@ -610,6 +704,7 @@ class NetworkInventoryCache(
                 hasData = !key.isPlain,
                 isCraftable = true,
                 componentsPatch = template.componentsPatch,
+                craftWarning = warning,
             )
         }
     }
@@ -665,13 +760,15 @@ class NetworkInventoryCache(
                 // poll has the real components and we want them to land.
                 val patchChanged = existing.info.componentsPatch != info.componentsPatch
                 val countChanged = existing.info.count != info.count
-                val craftableChanged = existing.info.isCraftable != info.isCraftable
+                val craftableChanged = existing.info.isCraftable != info.isCraftable ||
+                    existing.info.craftWarning != info.craftWarning
                 if (countChanged || craftableChanged || patchChanged) {
                     putEntry(key, existing.copy(
                         info = existing.info.copy(
                             count = info.count,
                             isCraftable = info.isCraftable,
                             componentsPatch = info.componentsPatch,
+                            craftWarning = info.craftWarning,
                         )
                     ))
                     changedSerials.add(existing.serial)

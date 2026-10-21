@@ -115,6 +115,7 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
                 is damien.nodeworks.block.entity.UserBlockEntity -> "user"
                 is damien.nodeworks.block.entity.ImportChestBlockEntity -> "import_chest"
                 is damien.nodeworks.block.entity.ExportChestBlockEntity -> "export_chest"
+                is damien.nodeworks.block.entity.MultiProcessingHandlerBlockEntity -> "multi_processing_handler"
                 is damien.nodeworks.block.entity.ProcessingHandlerBlockEntity -> "processing_handler"
                 is damien.nodeworks.block.entity.CraftRequesterBlockEntity -> "craft_requester"
                 is damien.nodeworks.block.entity.StorageMeterBlockEntity -> "storage_meter"
@@ -148,6 +149,9 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
             // Build detail lines based on block type
             val details = mutableListOf<String>()
             when (entity) {
+                is NodeBlockEntity -> {
+                    for (line in entity.transferStatus()) details.add(line)
+                }
                 is NetworkControllerBlockEntity -> {
                     // Mirror the player-visible rows in [NetworkControllerScreen]
                     // so the diagnostic and the controller GUI stay in sync.
@@ -243,6 +247,12 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
                         details.add("Filter rules: ${entity.filterRules.size}")
                         for (rule in entity.filterRules) details.add("  $rule")
                     }
+                }
+                is damien.nodeworks.block.entity.MultiProcessingHandlerBlockEntity -> {
+                    val names = entity.boundSetNames()
+                    details.add(if (names.isEmpty()) "Not bound" else "Recipes: ${names.size}")
+                    details.add("Inputs: ${channelFilterMarker(damien.nodeworks.network.ChannelFilter.Color(entity.inputChannel))}")
+                    details.add("Outputs: ${channelFilterMarker(damien.nodeworks.network.ChannelFilter.Color(entity.outputChannel))}")
                 }
                 is damien.nodeworks.block.entity.ProcessingHandlerBlockEntity -> {
                     // Recipe NAME is hidden, processing-set names from JEI etc.
@@ -344,8 +354,11 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
             val terminal = level.getBlockEntity(tPos) as? damien.nodeworks.block.entity.TerminalBlockEntity ?: return@mapNotNull null
             val isRunning = PlatformServices.modState.isScriptRunning(serverLevel, tPos)
             val handlers = if (isRunning) {
-                val engine = PlatformServices.modState.getScriptEngine(serverLevel, tPos)
-                (engine as? damien.nodeworks.script.ScriptEngine)?.processingHandlers?.keys?.toList() ?: emptyList()
+                val engine = PlatformServices.modState.getScriptEngine(serverLevel, tPos) as? damien.nodeworks.script.ScriptEngine
+                if (engine == null) emptyList()
+                // The open packet carries each name in at most 64 chars, a long rule is cut.
+                else engine.processingHandlers.keys.toList() +
+                    engine.recipeRules.filter { it.active }.map { if (it.label.length > 64) it.label.take(61) + "..." else it.label }
             } else emptyList()
             DiagnosticOpenData.TerminalInfo(
                 tPos, isRunning, terminal.scripts.keys.toList(), handlers, terminal.autoRun

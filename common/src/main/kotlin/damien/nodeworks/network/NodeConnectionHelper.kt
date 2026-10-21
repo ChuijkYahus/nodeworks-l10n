@@ -13,6 +13,9 @@ import net.minecraft.world.phys.shapes.CollisionContext
 import java.util.concurrent.ConcurrentHashMap
 
 object NodeConnectionHelper {
+    /** Positions per network id packet, about 32 KB each. */
+    private const val ID_BATCH_PACKET_POSITIONS = 4096
+
 
     // --- Advanced Node link gating: range + line of sight ---
     //
@@ -179,12 +182,24 @@ object NodeConnectionHelper {
      * Drained by [drainPendingRevalidations], called once per server tick. One-shot cost per
      * chunk load, zero cost on idle ticks.
      */
-    private val pendingRevalidateByDim = ConcurrentHashMap<ResourceKey<Level>, MutableSet<Long>>()
+    private val pendingRevalidateByDim = ConcurrentHashMap<ResourceKey<Level>, ConcurrentHashMap<Long, Set<Long>>>()
 
-    fun queueRevalidation(level: ServerLevel, pos: BlockPos) {
+    /**
+     * Queue [pos] for a walk next tick. [mustReach] names the positions the event that
+     * queued it used to join, see [propagateNetworkId]. A position queued by several
+     * events in one tick keeps the union, so a removal is never softened by a load.
+     */
+    fun queueRevalidation(level: ServerLevel, pos: BlockPos, mustReach: Collection<BlockPos> = emptyList()) {
+        val required: Set<Long> = if (mustReach.isEmpty()) emptySet() else mustReach.mapTo(HashSet()) { it.asLong() }
         pendingRevalidateByDim
-            .computeIfAbsent(level.dimension()) { java.util.Collections.newSetFromMap(ConcurrentHashMap()) }
-            .add(pos.asLong())
+            .computeIfAbsent(level.dimension()) { ConcurrentHashMap() }
+            .merge(pos.asLong(), required, ::unionOf)
+    }
+
+    private fun unionOf(a: Set<Long>, b: Set<Long>): Set<Long> = when {
+        b.isEmpty() -> a
+        a.isEmpty() -> b
+        else -> a + b
     }
 
     /** Spread large revalidation bursts (player teleport, render-distance jump)
@@ -197,18 +212,18 @@ object NodeConnectionHelper {
             if (pending.isEmpty()) continue
             // Snapshot so we can clear and let setLevel calls that happen DURING processing
             // accumulate into the next-tick batch rather than mutate the set we're iterating.
-            val snapshot = pending.toLongArray()
+            val snapshot = pending.entries.map { it.key to it.value }
             pending.clear()
             var processed = 0
-            for ((index, packed) in snapshot.withIndex()) {
+            for ((index, entry) in snapshot.withIndex()) {
                 if (processed >= MAX_REVALIDATIONS_PER_TICK) {
-                    for (i in index until snapshot.size) pending.add(snapshot[i])
+                    for (i in index until snapshot.size) pending.merge(snapshot[i].first, snapshot[i].second, ::unionOf)
                     break
                 }
-                val pos = BlockPos.of(packed)
+                val pos = BlockPos.of(entry.first)
                 if (!level.isLoaded(pos)) continue
                 val entity = getConnectable(level, pos) ?: continue
-                revalidateOnLoad(level, entity)
+                revalidateOnLoad(level, entity, entry.second.map { BlockPos.of(it) })
                 processed++
             }
         }
@@ -326,8 +341,9 @@ object NodeConnectionHelper {
         entityB?.removeConnection(posA)
         // Disconnection invalidates the persisted blocked-pair record.
         setPairBlocked(level, posA, posB, false)
-        if (entityA != null) propagateNetworkId(level, posA)
-        if (entityB != null) propagateNetworkId(level, posB)
+        val joined = listOf(posA, posB)
+        if (entityA != null) propagateNetworkId(level, posA, joined)
+        if (entityB != null) propagateNetworkId(level, posB, joined)
         return entityA != null || entityB != null
     }
 
@@ -367,7 +383,18 @@ object NodeConnectionHelper {
      *  Per-tick dedup via [propagatedThisTickByDim]: a second call whose
      *  startPos was already covered by a prior propagate's BFS no-ops. Keeps cost
      *  bounded when many blocks change near a large network in a single tick. */
-    fun propagateNetworkId(level: ServerLevel, startPos: BlockPos) {
+    /**
+     * Walk the subgraph at [startPos] and give it one id.
+     *
+     * [mustReach] is how a walk tells a split from a chunk load, which look the same from
+     * inside the walk. An event that may have cut the network, a broken block, a removed
+     * link, a wrench toggle, lost line of sight, names the positions it used to join. When
+     * one of them is still there, loaded, and this walk did not reach it, the loaded graph
+     * was split by that event, and this walk gives up the id it carried in from before
+     * the split rather than keeping it on the grounds that the rest may be unloaded. A
+     * load or a placement names nothing, neither can split.
+     */
+    fun propagateNetworkId(level: ServerLevel, startPos: BlockPos, mustReach: Collection<BlockPos> = emptyList()) {
         val coveredThisTick = propagatedThisTick(level)
         if (!coveredThisTick.add(startPos.asLong())) return
 
@@ -379,8 +406,8 @@ object NodeConnectionHelper {
         // neighbor pos so the BFS enters the Handler with a definite face.
         val startEntity = getConnectable(level, startPos)
         if (startEntity is damien.nodeworks.block.entity.ProcessingHandlerBlockEntity) {
-            propagateNetworkId(level, startPos.relative(startEntity.backFace))
-            propagateNetworkId(level, startPos.relative(startEntity.frontFace))
+            propagateNetworkId(level, startPos.relative(startEntity.backFace), mustReach)
+            propagateNetworkId(level, startPos.relative(startEntity.frontFace), mustReach)
             return
         }
 
@@ -398,12 +425,18 @@ object NodeConnectionHelper {
         val queue = ArrayDeque<Pair<BlockPos, Direction?>>()
         visited[startPos] = mutableSetOf(null)
         queue.add(startPos to null)
+        // True once the walk had to stop at an unloaded chunk, a laser into one or a
+        // block beside one. The rest of the network, its controller included, may sit there.
+        var touchedUnloaded = false
 
         while (queue.isNotEmpty()) {
             val (pos, entryFace) = queue.removeFirst()
             val entity = getConnectable(level, pos) ?: continue
             for (conn in entity.connectionsFromFace(entryFace)) {
-                if (!level.isLoaded(conn)) continue
+                if (!level.isLoaded(conn)) {
+                    touchedUnloaded = true
+                    continue
+                }
                 if (!checkLineOfSightCached(level, pos, conn)) continue
                 val face = faceFromTo(conn, pos)
                 if (registerVisit(level, conn, face, visited)) queue.add(conn to face)
@@ -412,9 +445,26 @@ object NodeConnectionHelper {
                 val face = faceFromTo(adjacentPos, pos)
                 if (registerVisit(level, adjacentPos, face, visited)) queue.add(adjacentPos to face)
             }
+            // Only a block on a chunk edge can have an unloaded neighbour, and only across
+            // that edge, so this costs a hundred thousand blocks a handful of chunk lookups.
+            if (!touchedUnloaded && entity.usesAdjacency()) {
+                val bx = pos.x and 15
+                val bz = pos.z and 15
+                if ((bx == 0 && !level.isLoaded(pos.west())) || (bx == 15 && !level.isLoaded(pos.east())) ||
+                    (bz == 0 && !level.isLoaded(pos.north())) || (bz == 15 && !level.isLoaded(pos.south()))
+                ) touchedUnloaded = true
+            }
         }
 
         for (p in visited.keys) coveredThisTick.add(p.asLong())
+
+        // A position the event joined that still stands, loaded, outside this walk means the
+        // event split the loaded graph. One the event removed is not held against it, one in
+        // an unloaded chunk cannot be checked and counts as split.
+        val splitProven = mustReach.any { p ->
+            !visited.containsKey(p) && (!level.isLoaded(p) || getConnectable(level, p) != null)
+        }
+        val mayKeepCarried = touchedUnloaded && !splitProven
 
         // Conflict detection. Three cases produce a null id (network goes grey):
         //   - Two Network Controllers in the same subgraph (parent network with
@@ -426,13 +476,23 @@ object NodeConnectionHelper {
         //   - A boundary Connectable visited from BOTH sides in this BFS, which
         //     is the same parent / micro mix detected from the boundary's POV.
         //   - Otherwise, the network's id is the Controller's permanentId when
-        //     present, else the lowest-positioned micro-anchor's permanentId.
+        //     present, else the lowest-positioned micro-anchor's permanentId, else
+        //     the lowest-positioned fallback anchor's (a Node's) permanentId, so a
+        //     network with no controller still has an identity.
         var foundId: java.util.UUID? = null
         var controllerCount = 0
         var microAnchor: Connectable? = null
+        var fallbackAnchor: Connectable? = null
         var boundaryDoubleVisited = false
+        // The one id the walked blocks carry, gathered in this same pass. Blocks without an
+        // id, like one just placed, do not count against it, two different ids do.
+        var carriedId: java.util.UUID? = null
+        var carriedMixed = false
         for ((pos, faces) in visited) {
             val entity = getConnectable(level, pos) ?: continue
+            entity.networkId?.let { id ->
+                if (carriedId == null) carriedId = id else if (carriedId != id) carriedMixed = true
+            }
             if (entity is damien.nodeworks.block.entity.NetworkControllerBlockEntity) {
                 controllerCount++
                 if (controllerCount == 1) foundId = entity.permanentId
@@ -451,12 +511,27 @@ object NodeConnectionHelper {
                 if (microAnchor == null || pos.asLong() < microAnchor.getBlockPos().asLong()) {
                     microAnchor = entity
                 }
+            } else if (entity.isFallbackAnchor()) {
+                if (fallbackAnchor == null || pos.asLong() < fallbackAnchor.getBlockPos().asLong()) {
+                    fallbackAnchor = entity
+                }
             }
         }
         if (boundaryDoubleVisited || (controllerCount >= 1 && microAnchor != null)) {
             foundId = null
         } else if (controllerCount == 0 && microAnchor != null) {
             foundId = microAnchor.microNetworkPermanentId
+        } else if (controllerCount == 0) {
+            // A controller or micro anchor id every walked block carries stays when the walk
+            // stopped at unloaded chunks, its anchor may be there, so a network whose
+            // controller's chunk is out does not degrade to a Node id and back on every
+            // edit or load. Then the Node anchor id the subgraph carries stays while its
+            // anchor Node is among the walked, so placing or loading a lower Node does not
+            // re-id a whole network. A merge, two ids, or an anchor out of reach falls back
+            // to the lowest Node.
+            val carried = if (carriedMixed) null else carriedId
+            foundId = carriedBeyondUnloaded(carried, mayKeepCarried)
+                ?: fallbackAnchor?.let { carriedAnchorId(level, carried, visited, mayKeepCarried) ?: it.fallbackAnchorId }
         }
 
         // Apply the new id. For PHandler, the destination field depends on which
@@ -516,15 +591,56 @@ object NodeConnectionHelper {
         }
         for (otherPos in otherSideRequeues) queueRevalidation(level, otherPos)
 
-        if (changedPositions.isNotEmpty()) {
-            damien.nodeworks.platform.PlatformServices.serverNetworking.sendToPlayersInDimension(
+        // In pieces, so a network of a hundred thousand blocks never builds one packet
+        // past the size a client accepts, and each piece reaches only the players who
+        // can see its blocks.
+        for (piece in changedPositions.chunked(ID_BATCH_PACKET_POSITIONS)) {
+            damien.nodeworks.platform.PlatformServices.serverNetworking.sendToPlayersTracking(
                 level,
-                NetworkIdBatchPayload(foundId, changedPositions),
+                piece,
+                NetworkIdBatchPayload(foundId, piece),
             )
         }
 
         foundId?.let { NetworkDiscovery.invalidate(it) }
         for (id in previousIds) NetworkDiscovery.invalidate(id)
+        // The network's inventory cache follows the id, so a chunk loading a lower Node
+        // or a controller coming back changes nothing a terminal on it can see: no
+        // rescan, no resync.
+        if (foundId != null) for (id in previousIds) {
+            // Only an id whose anchor Node was walked has no holders left behind, so only
+            // then does its cache follow. After a split the half that kept the old id keeps
+            // its cache, and a controller id waits for its controller to come back.
+            if (NetworkIds.isNodeAnchor(id) && visited.containsKey(BlockPos.of(id.mostSignificantBits))) {
+                damien.nodeworks.script.NetworkInventoryCache.renameKey(id, foundId)
+            }
+        }
+    }
+
+    /** The one controller or micro anchor id every walked Connectable with an id agrees
+     *  on, when the walk was cut short by unloaded chunks and that anchor may be beyond
+     *  them. Blocks without an id, like one just placed, do not count against it. Null
+     *  when the subgraph was fully loaded, the ids differ, the id is a Node anchor's, or
+     *  the controller is known to have been broken. */
+    private fun carriedBeyondUnloaded(carried: java.util.UUID?, mayKeepCarried: Boolean): java.util.UUID? {
+        if (!mayKeepCarried || carried == null) return null
+        if (NetworkIds.isNodeAnchor(carried)) return null
+        return if (NetworkIds.isRetiredController(carried)) null else carried
+    }
+
+    /** The Node anchor id the walked blocks agree on, when that anchor Node was walked and
+     *  still lends it, or sits in an unloaded chunk the walk stopped at. Null when the ids
+     *  differ, nothing carries one, or the anchor is loaded but out of reach, which means
+     *  it was cut off or broken. */
+    private fun carriedAnchorId(level: ServerLevel, carried: java.util.UUID?, visited: Map<BlockPos, *>, mayKeepCarried: Boolean): java.util.UUID? {
+        val id = carried ?: return null
+        if (!NetworkIds.isNodeAnchor(id)) return null
+        val anchorPos = BlockPos.of(id.mostSignificantBits)
+        if (!visited.containsKey(anchorPos)) {
+            return if (mayKeepCarried && !level.isLoaded(anchorPos)) id else null
+        }
+        val anchor = getConnectable(level, anchorPos) ?: return null
+        return if (anchor.isFallbackAnchor() && anchor.fallbackAnchorId == id) id else null
     }
 
     /** Face-adjacent Connectable BEs. Both endpoints must opt into adjacency, and both
@@ -604,9 +720,10 @@ object NodeConnectionHelper {
         }
     }
 
-    /** Re-propagate from this position when a Connectable's chunk loads. */
-    fun revalidateOnLoad(level: ServerLevel, self: Connectable) {
-        propagateNetworkId(level, self.getBlockPos())
+    /** Re-propagate from this position when a Connectable's chunk loads, or when a queued
+     *  event asked for it, with the positions that event used to join. */
+    fun revalidateOnLoad(level: ServerLevel, self: Connectable, mustReach: Collection<BlockPos> = emptyList()) {
+        propagateNetworkId(level, self.getBlockPos(), mustReach)
     }
 
     // --- Block-change driven LOS revalidation ---
@@ -660,10 +777,12 @@ object NodeConnectionHelper {
             if (!wasBlocked && !hasLos && trySplice(level, nodePos, targetPos, changedPos)) continue
 
             setPairBlocked(level, nodePos, targetPos, !hasLos)
-            propagateNetworkId(level, nodePos)
+            // A blocked link may have split the network, a restored one can only join.
+            val joined = if (hasLos) emptyList() else listOf(nodePos, targetPos)
+            propagateNetworkId(level, nodePos, joined)
             // BFS from nodePos can't cross the now-blocked edge, so the far
             // end (which may have lost its controller) needs its own propagate.
-            if (!hasLos) propagateNetworkId(level, targetPos)
+            if (!hasLos) propagateNetworkId(level, targetPos, joined)
         }
     }
 
@@ -714,8 +833,12 @@ object NodeConnectionHelper {
         // Surviving neighbours may have just lost their path to a controller. Gated on
         // [blockDestroyed] so this only runs on real player destruction, not chunk unload.
         if (entity.blockDestroyed) {
+            // Everything the block joined, by laser and by touch. Each walk must reach all
+            // of it to keep an id from before, otherwise the block held two parts together.
+            val joined = ArrayList<BlockPos>(neighbors)
+            joined.addAll(adjacentConnectableNeighbors(level, pos, entity, null))
             for (neighborPos in neighbors) {
-                propagateNetworkId(level, neighborPos)
+                propagateNetworkId(level, neighborPos, joined)
             }
             // Also re-propagate from face-adjacent Connectables so a destroyed Node frees
             // its old subgraph correctly.
@@ -723,7 +846,7 @@ object NodeConnectionHelper {
                 val adjPos = pos.relative(dir)
                 if (!level.isLoaded(adjPos)) continue
                 if (level.getBlockEntity(adjPos) !is Connectable) continue
-                propagateNetworkId(level, adjPos)
+                propagateNetworkId(level, adjPos, joined)
             }
         }
     }

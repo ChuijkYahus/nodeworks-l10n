@@ -127,6 +127,7 @@ object NeoForgeTerminalPackets {
         terminalPositions: List<BlockPos>,
         cardName: String,
         overrideDimension: ResourceKey<Level>? = null,
+        api: damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo? = null,
     ): ScriptEngine? {
         val dimKey = overrideDimension ?: level.dimension()
         for (pos in terminalPositions) {
@@ -134,6 +135,13 @@ object NeoForgeTerminalPackets {
             if (engine.isRunning() && engine.processingHandlers.containsKey(cardName)) {
                 return engine
             }
+        }
+        // Rules only after every terminal had its say, an exact handler on any of them
+        // beats a rule on another.
+        if (api == null) return null
+        for (pos in terminalPositions) {
+            val engine = activeEngines[GlobalPos.of(dimKey, pos)] ?: continue
+            if (engine.isRunning() && engine.handlerFor(cardName, api) != null) return engine
         }
         return null
     }
@@ -209,7 +217,7 @@ object NeoForgeTerminalPackets {
             val globalSlot = side.ordinal * NodeBlockEntity.SLOTS_PER_SIDE + payload.slotIndex
             val cardStack = nodeEntity.getItem(globalSlot)
             if (cardStack.item !is InstructionSet) return@enqueueWork
-            val recipe = InstructionSet.getRecipe(cardStack)
+            val recipe = InstructionSet.getRecipeStacks(cardStack)
             val subs = InstructionSet.getSubstitutions(cardStack)
 
             PlatformServices.menu.openExtendedMenu(
@@ -255,7 +263,7 @@ object NeoForgeTerminalPackets {
             val player = context.player()
             val menu = player.containerMenu
             if (menu is InstructionSetScreenHandler && menu.containerId == payload.containerId) {
-                menu.setRecipeFromIds(payload.items)
+                menu.setRecipeFromStacks(payload.items)
             }
         }
     }

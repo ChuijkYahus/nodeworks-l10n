@@ -135,6 +135,29 @@ class InventoryTerminalMenu(
     // Scoped to one [clicked] call. Any other route into [quickMoveStack]
     // (other mods, vanilla paths) gets the one-stack default.
     private var craftAllOnQuickMove = false
+
+    /** The grid's last recipe match, tried first on every grid change so a run of
+     *  identical crafts never rescans the recipe list. */
+    private val craftingCheck = net.minecraft.world.item.crafting.RecipeManager
+        .createCheck<net.minecraft.world.item.crafting.CraftingInput, CraftingRecipe>(RecipeType.CRAFTING)
+    private var lastRecipe: net.minecraft.world.item.crafting.RecipeHolder<CraftingRecipe>? = null
+
+    /** True while a batch of crafts runs. Each grid change inside would otherwise
+     *  broadcast every slot and sync the terminal on its own. One sync follows the batch. */
+    private var batchCrafting = false
+
+    /** A craft-all that used up its slice of the tick with more to craft. Carried on a
+     *  slice per tick by [broadcastChanges] until the recipe stops matching, the inventory
+     *  is full, or the player does anything else. */
+    private var craftAllResult: ItemStack? = null
+        set(value) {
+            if ((field == null) != (value == null)) activeCraftAll += if (value != null) 1 else -1
+            field = value
+        }
+
+    /** True while vanilla's slot change hook runs. A craft-all must not continue from
+     *  inside it, that would craft in the middle of whatever changed the slot. */
+    private var inSlotsChanged = false
     val craftingContainer = TransientCraftingContainer(this, 3, 3)
     val resultContainer = ResultContainer()
 
@@ -163,7 +186,7 @@ class InventoryTerminalMenu(
         }
 
         // Crafting output slot (slot 45)
-        addSlot(ResultSlot(playerInventory.player, craftingContainer, resultContainer, 0, -999, -999))
+        addSlot(TerminalResultSlot(playerInventory.player))
 
         // Link crystal slot (Handheld only). The slot lives at (-999, -999), the
         // screen renders it at its real on-screen position and dispatches clicks
@@ -194,8 +217,8 @@ class InventoryTerminalMenu(
             // doesn't expose getRecipeFor in 26.1).
             val level = serverLevel
             if (level != null) {
-                val recipe = level.recipeAccess()
-                    .getRecipeFor(RecipeType.CRAFTING, craftingContainer.asCraftInput(), level)
+                val recipe = craftingCheck.getRecipeFor(craftingContainer.asCraftInput(), level)
+                lastRecipe = recipe.orElse(null)
                 if (recipe.isPresent) {
                     // assemble(input) in 26.1, registryAccess folded into the recipe.
                     resultContainer.setItem(0, recipe.get().value().assemble(craftingContainer.asCraftInput()))
@@ -207,7 +230,12 @@ class InventoryTerminalMenu(
         if (container === crystalContainer) {
             onCrystalSlotChanged()
         }
-        super.slotsChanged(container)
+        inSlotsChanged = true
+        try {
+            super.slotsChanged(container)
+        } finally {
+            inSlotsChanged = false
+        }
     }
 
     /**
@@ -489,6 +517,26 @@ class InventoryTerminalMenu(
      *     resolve. This is what lets the menu recover transparently when the antenna's
      *     chunk loads back in or the player walks back into range.
      */
+    /** The registry can replace a cache underneath us when its network's id moves to
+     *  another anchor or a controller, or when an orphan is evicted. Runs once a second
+     *  for every terminal, fixed or handheld, so the view never freezes on a cache
+     *  nobody polls any more. Looks the cache up without reseating its entry point,
+     *  two terminals on one network must not take turns forcing rescans. */
+    private fun refreshCacheBinding() {
+        val lvl = serverLevel ?: return
+        val src = source ?: return
+        val current = cache ?: return
+        val live = NetworkInventoryCache.existing(lvl, src.entryPoint)
+            ?: NetworkInventoryCache.getOrCreate(lvl, src.entryPoint)
+        if (live !== current) {
+            cache = live
+            networkNeedsSync = true
+            // A new cache numbers its rows from one again, so the client gets the grid afresh.
+            needsFullSync = true
+            fullSyncChunks = null
+        }
+    }
+
     private fun tickRefreshConnection() {
         if (crystalHolderProvider == null) return
         val serverPlayer = playerInventory.player as? ServerPlayer ?: return
@@ -500,6 +548,54 @@ class InventoryTerminalMenu(
 
         if (source == null) {
             tryResolveSource()
+        }
+    }
+
+    /** The vanilla result slot finds the recipe again on every take to learn its
+     *  remainders. The grid's last match is at hand, so a take that still matches it
+     *  uses that, and only a grid that no longer matches pays for a fresh lookup. The
+     *  remainder placement is vanilla's, step for step. */
+    private inner class TerminalResultSlot(player: Player) :
+        ResultSlot(player, craftingContainer, resultContainer, 0, -999, -999) {
+
+        override fun onTake(player: Player, carried: ItemStack) {
+            val lvl = serverLevel
+            val recipe = lastRecipe
+            val positioned = craftingContainer.asPositionedCraftInput()
+            val input = positioned.input()
+            if (lvl == null || recipe == null || !recipe.value().matches(input, lvl)) {
+                super.onTake(player, carried)
+                return
+            }
+            checkTakeAchievements(carried)
+            val remaining = damien.nodeworks.platform.PlatformServices.crafting.withCraftingPlayer(player) { recipe.value().getRemainingItems(input) }
+            // One grid change at the end instead of one per consumed slot.
+            suppressSlotsChanged = true
+            try {
+                for (y in 0 until input.height()) {
+                    for (x in 0 until input.width()) {
+                        val slot = x + positioned.left() + (y + positioned.top()) * craftingContainer.width
+                        var stack = craftingContainer.getItem(slot)
+                        val replacement = remaining[x + y * input.width()]
+                        if (!stack.isEmpty) {
+                            craftingContainer.removeItem(slot, 1)
+                            stack = craftingContainer.getItem(slot)
+                        }
+                        if (replacement.isEmpty) continue
+                        if (stack.isEmpty) {
+                            craftingContainer.setItem(slot, replacement)
+                        } else if (ItemStack.isSameItemSameComponents(stack, replacement)) {
+                            replacement.grow(stack.count)
+                            craftingContainer.setItem(slot, replacement)
+                        } else if (!player.inventory.add(replacement)) {
+                            player.drop(replacement, false)
+                        }
+                    }
+                }
+            } finally {
+                suppressSlotsChanged = false
+            }
+            slotsChanged(craftingContainer)
         }
     }
 
@@ -516,6 +612,24 @@ class InventoryTerminalMenu(
          *  (Ctrl+Shift-click). Buttons 0/1 craft one stack's worth. Vanilla only
          *  acts on 0/1, so [clicked] maps this back to 0 before delegating. */
         const val CRAFT_ALL_BUTTON = 2
+
+        /** Time one menu may spend crafting in a tick when it is the only one. A craft-all
+         *  that needs more carries on next tick, so a huge order never stalls the server. */
+        private const val CRAFT_BATCH_NANOS = 4_000_000L
+
+        /** Time every craft-all on the server shares per tick, and the least one gets,
+         *  so fifty players crafting at once cannot each take their own slice. */
+        private const val CRAFT_ALL_TOTAL_NANOS = 8_000_000L
+        private const val CRAFT_BATCH_MIN_NANOS = 500_000L
+
+        /** Menus with a craft-all in progress. Server thread only. */
+        private var activeCraftAll = 0
+
+        private fun craftSliceNanos(): Long =
+            (CRAFT_ALL_TOTAL_NANOS / activeCraftAll.coerceAtLeast(1)).coerceIn(CRAFT_BATCH_MIN_NANOS, CRAFT_BATCH_NANOS)
+
+        /** Crafts one batch may run, a bound on a grid that never stops matching. */
+        private const val CRAFT_BATCH_SAFETY = 4096
         private const val BUCKET_MB = 1000L
 
         /**
@@ -572,41 +686,9 @@ class InventoryTerminalMenu(
             // (always, in creative) and would void the overflow. The 4096
             // bound covers a full 9-input 64-per-stack grid.
             if (serverLevel != null) {
-                var crafted = 0
-                var safety = 0
-                while (slot.hasItem() && safety < 4096) {
-                    safety++
-                    val nextResult = slot.item.copy()
-                    // Leftovers (buckets etc.) can make the grid match a
-                    // different recipe. Same stop rule as vanilla's loop.
-                    if (!ItemStack.isSameItem(nextResult, firstResult)) break
-                    // One stack's worth unless Ctrl+Shift. Counted in items so
-                    // a 4-per-craft recipe stops at 64, and the first craft
-                    // always runs so tools and oversized yields still work.
-                    if (!craftAllOnQuickMove && crafted > 0 &&
-                        crafted + nextResult.count > firstResult.maxStackSize) break
-                    if (!canFitFully(nextResult)) break
-                    val inserted = nextResult.copy()
-                    playerInventory.add(inserted)
-                    crafted += nextResult.count
-                    // The gate guarantees a full insert. Route any leftover
-                    // to network storage rather than voiding it.
-                    if (!inserted.isEmpty) {
-                        val lvl = serverLevel
-                        val snap = snapshot
-                        if (lvl != null && snap != null) {
-                            NetworkStorageHelper.insertItemStack(lvl, snap, inserted, cache, channel = channel)
-                        }
-                    }
-                    // Refill consumes the pattern, re-snapshot while the
-                    // grid still holds the ingredients.
-                    if (autoPull) autoPullPattern = snapshotCraftPattern()
-                    slot.onTake(player, nextResult)
-                    // onTake consumes the grid and slotsChanged writes the
-                    // next result. Refill inline, chaining must not rely on
-                    // vanilla's QUICK_MOVE re-entry (see the return below).
-                    if (autoPull && !slot.hasItem()) autoPullRefill()
-                }
+                craftAllResult = null
+                val more = craftBatch(player, slot, firstResult, craftAllOnQuickMove, System.nanoTime() + craftSliceNanos())
+                if (more && craftAllOnQuickMove) craftAllResult = firstResult
                 // Always EMPTY. A non-empty return re-enters vanilla's
                 // QUICK_MOVE loop while auto-pull keeps the slot populated,
                 // spinning the server thread forever once the inventory fills.
@@ -646,7 +728,64 @@ class InventoryTerminalMenu(
         return ItemStack.EMPTY
     }
 
+    /** Crafts from the result slot into the player's inventory until the recipe stops
+     *  matching, the next full result no longer fits, a plain shift-click reaches one
+     *  stack's worth, or the slice of time runs out. The fit gate is [canFitFully], not
+     *  Inventory.add, which reports success on partial inserts (always, in creative)
+     *  and would void the overflow. Nothing is broadcast while it runs. Returns true
+     *  when it stopped on time with more to craft. */
+    private fun craftBatch(player: Player, slot: Slot, firstResult: ItemStack, craftAll: Boolean, deadline: Long): Boolean {
+        var crafted = 0
+        var safety = 0
+        var outOfTime = false
+        batchCrafting = true
+        try {
+            while (slot.hasItem() && safety < CRAFT_BATCH_SAFETY) {
+                safety++
+                val nextResult = slot.item.copy()
+                // Leftovers (buckets etc.) can make the grid match a
+                // different recipe. Same stop rule as vanilla's loop.
+                if (!ItemStack.isSameItem(nextResult, firstResult)) break
+                // One stack's worth unless craft-all. Counted in items so a
+                // 4-per-craft recipe stops at 64, and the first craft always
+                // runs so tools and oversized yields still work.
+                if (!craftAll && crafted > 0 && crafted + nextResult.count > firstResult.maxStackSize) break
+                if (!canFitFully(nextResult)) break
+                if (crafted > 0 && System.nanoTime() >= deadline) {
+                    outOfTime = true
+                    break
+                }
+                val inserted = nextResult.copy()
+                playerInventory.add(inserted)
+                crafted += nextResult.count
+                // The gate guarantees a full insert. Route any leftover
+                // to network storage rather than voiding it.
+                if (!inserted.isEmpty) {
+                    val lvl = serverLevel
+                    val snap = snapshot
+                    if (lvl != null && snap != null) {
+                        NetworkStorageHelper.insertItemStack(lvl, snap, inserted, cache, channel = channel)
+                    }
+                }
+                // Refill consumes the pattern, re-snapshot while the
+                // grid still holds the ingredients.
+                if (autoPull) autoPullPattern = snapshotCraftPattern()
+                slot.onTake(player, nextResult)
+                // onTake consumes the grid and slotsChanged writes the
+                // next result. Refill inline, chaining must not rely on
+                // vanilla's QUICK_MOVE re-entry.
+                if (autoPull && !slot.hasItem()) autoPullRefill(bulk = craftAll)
+            }
+        } finally {
+            batchCrafting = false
+        }
+        if (crafted > 0) needsImmediateSync = true
+        return outOfTime
+    }
+
     override fun clicked(slotId: Int, button: Int, clickType: net.minecraft.world.inventory.ContainerInput, player: Player) {
+        // Any click ends a craft-all still running from an earlier one.
+        craftAllResult = null
         // Capture the grid pattern BEFORE super.clicked() consumes ingredients
         var resultBefore: ItemStack? = null
         if (slotId == CRAFT_OUTPUT_SLOT && !resultContainer.getItem(0).isEmpty && autoPull) {
@@ -669,7 +808,7 @@ class InventoryTerminalMenu(
         // refill deferred to broadcastChanges would land a tick late with an empty result
         // slot in between.
         if (autoPullPattern != null) {
-            if (serverLevel != null) autoPullRefill() else predictRefill(resultBefore)
+            if (serverLevel != null) autoPullRefill(bulk = false) else predictRefill(resultBefore)
         }
     }
 
@@ -1433,7 +1572,10 @@ class InventoryTerminalMenu(
      * After a crafting result is taken, refill empty grid slots from network storage.
      * Only runs when autoPull is enabled.
      */
-    private fun autoPullRefill() {
+    /** [bulk] is a craft-all: whole stacks go into each slot so the next crafts draw from
+     *  the grid. A plain click or shift-click pulls one per slot, as a pattern would, so
+     *  the network is not emptied into the grid for a single craft. */
+    private fun autoPullRefill(bulk: Boolean) {
         if (!autoPull) return
         val lvl = serverLevel ?: return
         val snap = snapshot ?: return
@@ -1445,15 +1587,41 @@ class InventoryTerminalMenu(
         // different recipes and corrupt lastCraftPattern
         suppressSlotsChanged = true
         try {
+            // Empty slots that want the same item share one pull, split evenly, so a recipe
+            // using an item in four slots keeps crafting while the network holds enough for
+            // all four, instead of filling the first slot and starving the rest.
+            val groups = LinkedHashMap<damien.nodeworks.script.BufferKey.Key, MutableList<Int>>()
             for ((i, template) in pattern.withIndex()) {
                 if (template.isEmpty) continue
-                val current = craftingContainer.getItem(i)
-                if (!current.isEmpty) continue
-
+                if (!craftingContainer.getItem(i).isEmpty) continue
+                groups.getOrPut(damien.nodeworks.script.BufferKey.of(template)) { ArrayList() }.add(i)
+            }
+            for ((_, slots) in groups) {
+                val template = pattern[slots[0]]
                 val itemId = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(template.item).toString()
-                val stacks = extractRealStacks(lvl, snap, c, itemId, 1L, template.componentsPatch)
-                val refill = stacks.firstOrNull() ?: continue
-                craftingContainer.setItem(i, refill)
+                val perSlot = if (bulk) template.maxStackSize.toLong() else 1L
+                val stacks = extractRealStacks(lvl, snap, c, itemId, perSlot * slots.size, template.componentsPatch)
+                var total = 0L
+                for (stack in stacks) total += stack.count
+                if (total <= 0L) continue
+                val per = (total / slots.size).toInt()
+                var placed = 0L
+                if (per > 0) {
+                    for (slot in slots) {
+                        craftingContainer.setItem(slot, template.copyWithCount(per))
+                        placed += per
+                    }
+                }
+                // The pulled stacks are one variant, the patch narrowed them, so the share
+                // that found no slot goes back as copies of the template.
+                var rest = total - placed
+                while (rest > 0L) {
+                    val n = minOf(rest, template.maxStackSize.toLong()).toInt()
+                    val back = template.copyWithCount(n)
+                    val stored = NetworkStorageHelper.insertItemStack(lvl, snap, back, c, channel = channel)
+                    if (stored < n) playerInventory.placeItemBackInInventory(template.copyWithCount(n - stored))
+                    rest -= n
+                }
             }
         } finally {
             suppressSlotsChanged = false
@@ -1750,6 +1918,7 @@ class InventoryTerminalMenu(
 
     override fun removed(player: Player) {
         super.removed(player)
+        craftAllResult = null
         // The screen's removed() runs this on the client too, including when JEI swaps
         // its recipe view in front. Only the server owns the grid, the client copy must
         // keep showing it. Vanilla's crafting table gets the same guard from its
@@ -1865,11 +2034,20 @@ class InventoryTerminalMenu(
     }
 
     override fun broadcastChanges() {
+        if (batchCrafting) return
+        if (!inSlotsChanged) craftAllResult?.let { result ->
+            val slot = slots[CRAFT_OUTPUT_SLOT]
+            val more = slot.hasItem() &&
+                craftBatch(playerInventory.player, slot, result, craftAll = true, System.nanoTime() + craftSliceNanos())
+            if (!more) craftAllResult = null
+        }
         super.broadcastChanges()
 
         val serverPlayer = playerInventory.player as? ServerPlayer ?: return
         tickCounter++
         applyRequestedChannel()
+
+        if (tickCounter % 20 == 0) refreshCacheBinding()
 
         // Handheld recovery: once per second verify the source is still valid and
         // re-attempt resolve if the menu is disconnected. Fixed terminals skip this.
@@ -1941,6 +2119,7 @@ class InventoryTerminalMenu(
                         hasData = entry.info.hasData,
                         craftable = entry.info.isCraftable,
                         componentsPatch = entry.info.componentsPatch,
+                        craftWarning = entry.info.craftWarning,
                     )
                 }
                 val fluidEntries = c.getAllFluidEntries().map { entry ->
@@ -2024,6 +2203,7 @@ class InventoryTerminalMenu(
                     hasData = entry.info.hasData,
                     craftable = entry.info.isCraftable,
                     componentsPatch = entry.info.componentsPatch,
+                    craftWarning = entry.info.craftWarning,
                 )
             }
             val fluidEntries = changedFluids.map { entry ->
@@ -2066,6 +2246,7 @@ class InventoryTerminalMenu(
             live?.add(entry.serial)
             val prev = since?.get(entry.serial)
             if (prev != null && prev.count == count && prev.craftable == info.isCraftable &&
+                prev.craftWarning == info.craftWarning &&
                 prev.name == info.name && prev.componentsPatch == info.componentsPatch
             ) return@forEachEntry
             out += InventorySyncPayload.SyncEntry(
@@ -2077,6 +2258,7 @@ class InventoryTerminalMenu(
                 hasData = info.hasData,
                 craftable = info.isCraftable,
                 componentsPatch = info.componentsPatch,
+                craftWarning = info.craftWarning,
             )
         }
         val fluidCounts = c.channelFluidCounts(color)

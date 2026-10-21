@@ -60,6 +60,11 @@ class ExportChestBlockEntity(
 ) : BlockEntity(ModBlockEntities.EXPORT_CHEST, pos, state), Container, Connectable, LidBlockEntity {
 
     companion object {
+        /** Scan cursors kept per chest, see [pullCursors]. */
+        private const val MAX_PULL_CURSORS = 1024
+        /** How long an edited rule list waits before the chest pulls by it. */
+        private const val RULE_SETTLE_TICKS = 40L
+
         const val SLOT_COUNT = 9
         const val DEFAULT_TICK_INTERVAL = 20
         const val MIN_TICK_INTERVAL = 1
@@ -93,9 +98,28 @@ class ExportChestBlockEntity(
      *  drain the network). */
     var filterRules: List<String> = emptyList()
         set(value) {
-            field = value.toList()
+            val next = value.toList()
+            // An edited list waits a moment before it acts, so a rule being typed does
+            // not pull the network through each of its half-finished forms. Saving is
+            // untouched, only the pull holds off.
+            if (next != field) rulesSettleAt = (level?.gameTime ?: 0L) + RULE_SETTLE_TICKS
+            field = next
             markDirtyAndSync()
         }
+
+    /** Game time from which the current rule list may pull. Not saved, a reload
+     *  starts with settled rules. */
+    private var rulesSettleAt: Long = 0L
+
+    /** Where each faced inventory's scan stopped last run, and which card the next run
+     *  starts at, so a pull the move deadline cuts short resumes instead of rescanning.
+     *  Least recently used cursors go once the map is full, so a chest on a network of
+     *  many thousand cards never holds a cursor for each. */
+    private val pullCursors = object : LinkedHashMap<BlockPos, damien.nodeworks.platform.ScanCursor>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<BlockPos, damien.nodeworks.platform.ScanCursor>): Boolean =
+            size > MAX_PULL_CURSORS
+    }
+    private val pullRotation = damien.nodeworks.script.NetworkTransfer.RoundRobinCursor()
 
     /** Channel scope for the network-pull side. ALL pulls from every storage
      *  card on the network, [ChannelFilter.Color] restricts to one channel. */
@@ -187,7 +211,7 @@ class ExportChestBlockEntity(
         // Empty rule list = no auto-pull (fresh chest doesn't drain the
         // network). Push side is independent so a buffer with manually-placed
         // items still drains even with no rules.
-        if (filterRules.isNotEmpty()) pullFromNetwork(level)
+        if (filterRules.isNotEmpty() && level.gameTime >= rulesSettleAt) pullFromNetwork(level)
         if (pushFace != null) pushToAdjacent(level, pushFace!!)
         // Wireless dispatch: if a Broadcast Antenna is sitting next to this
         // chest, fan items out to every Receiver Antenna paired with that
@@ -196,17 +220,10 @@ class ExportChestBlockEntity(
         pushWireless(level)
     }
 
-    /** Whitelist match: any rule hits = accept. Component-aware so
-     *  `minecraft:potion[components]` rules narrow to the variant rather
-     *  than every potion sharing the itemId. */
-    private fun matchesFilter(stack: ItemStack, registries: net.minecraft.core.HolderLookup.Provider): Boolean =
-        filterRules.any { rule -> CardHandle.matchesFilter(stack, rule, registries) }
-
-    /** Walk the network's storage cards, extract filter-matched items into
-     *  our buffer until either the buffer is full or the network is empty of
-     *  matches. Filter syntax matches the Storage Card filter (delegates to
-     *  [CardHandle.matchesFilter]) so the script-side autocomplete and the
-     *  Export Chest's UI both speak the same dialect. */
+    /** Pull filter-matched items from the network's storage cards into our buffer
+     *  until either the buffer is full or the network is empty of matches. Filter
+     *  syntax matches the Storage Card filter so the script-side autocomplete and
+     *  the Export Chest's UI both speak the same dialect. */
     private fun pullFromNetwork(level: ServerLevel) {
         // Match Import Chest: use this BE's own networkId rather than
         // `snapshot.controller != null` so micro-networks (Processing
@@ -221,39 +238,26 @@ class ExportChestBlockEntity(
         }
         if (totalSpace <= 0L) return
 
-        val cache = damien.nodeworks.script.NetworkInventoryCache.getOrCreate(level, worldPosition)
-        val registries = level.registryAccess()
-        // Stack-aware predicate so `id[components]` rules pick the right
-        // variant out of a mixed-component chest.
-        val filterPred: (ItemStack) -> Boolean = { stack -> matchesFilter(stack, registries) }
-        var changed = false
-        for (card in NetworkStorageHelper.getStorageCards(snapshot)) {
-            if (totalSpace <= 0L) break
-            if (!channel.matches(card.channel)) continue
-            val storage = NetworkStorageHelper.getStorage(level, card) ?: continue
-            val extracted = PlatformServices.storage.extractStacksByPredicate(storage, filterPred, totalSpace)
-            for (stack in extracted) {
-                if (stack.isEmpty) continue
-                val placed = placeIntoBuffer(stack)
-                if (placed > 0) {
-                    val itemId = net.minecraft.core.registries.BuiltInRegistries.ITEM
-                        .getKey(stack.item)?.toString()
-                    if (itemId != null) cache?.onExtracted(
-                        itemId, !stack.componentsPatch.isEmpty, placed.toLong(), stack.componentsPatch,
+        val cache = damien.nodeworks.script.NetworkInventoryCache.existing(level, worldPosition)
+        // The same per-network move time the Transfer Cards share, so a chest whose rules
+        // match nothing cannot walk a million slots every interval unchecked. A run the
+        // budget stops resumes from its cursors next interval.
+        val tick = PlatformServices.modState.tickCount
+        val budget = damien.nodeworks.script.NetworkRateLimits.forTransferCards(networkId)
+        val placed = budget.timedMove(tick, atomic = false) {
+            damien.nodeworks.script.NetworkTransfer.pull(
+                level, snapshot, cache, filterRules, channel, totalSpace,
+                spill = { stack ->
+                    net.minecraft.world.Containers.dropItemStack(
+                        level, worldPosition.x + 0.5, worldPosition.y + 0.5, worldPosition.z + 0.5, stack,
                     )
-                    totalSpace -= placed
-                    changed = true
-                }
-                if (placed < stack.count) {
-                    // Buffer filled mid-stack, return the leftover to the network.
-                    // Rare since we pre-computed totalSpace, but covers edge cases
-                    // where slot stack-size is tighter than the texture's 64-default.
-                    val leftover = stack.copyWithCount(stack.count - placed)
-                    NetworkStorageHelper.insertItemStack(level, snapshot, leftover, cache)
-                }
-            }
+                },
+                sink = ::placeIntoBuffer,
+                cursorFor = { pos -> pullCursors.getOrPut(pos) { damien.nodeworks.platform.ScanCursor() } },
+                rotation = pullRotation,
+            )
         }
-        if (changed) setChanged()
+        if (placed > 0L) setChanged()
     }
 
     /** Try to merge [stack] into the buffer: stack-merge first, then fill empty
@@ -316,6 +320,21 @@ class ExportChestBlockEntity(
 
     /** Find an adjacent Broadcast Antenna whose detected source resolves
      *  back to this chest. Symmetric to [BroadcastAntennaBlockEntity.detectSource]. */
+    /** True when a Broadcast Antenna beside this chest has picked it as its source. Safe
+     *  on the client, where the renderer uses it: a chest with no network of its own but
+     *  an antenna still has somewhere to send, so it lights up. */
+    fun hasBroadcastAntenna(): Boolean {
+        val lvl = level ?: return false
+        for (dir in Direction.entries) {
+            val neighborPos = worldPosition.relative(dir)
+            if (!lvl.isLoaded(neighborPos)) continue
+            val be = lvl.getBlockEntity(neighborPos) as? BroadcastAntennaBlockEntity ?: continue
+            val source = be.detectSource() ?: continue
+            if (source.first == damien.nodeworks.item.BroadcastSourceKind.EXPORT_CHEST && source.second == worldPosition) return true
+        }
+        return false
+    }
+
     private fun adjacentBroadcastAntenna(level: ServerLevel): BroadcastAntennaBlockEntity? {
         for (dir in Direction.entries) {
             val neighborPos = worldPosition.relative(dir)
@@ -541,7 +560,7 @@ class ExportChestBlockEntity(
         networkId = input.getStringOrNull("networkId")?.takeIf { it.isNotEmpty() }?.let {
             try { UUID.fromString(it) } catch (_: Exception) { null }
         }
-        damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
+        if (level != null) damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(worldPosition)
         connections.clear()
         connections.addAll(input.getBlockPosList("connections"))
     }
