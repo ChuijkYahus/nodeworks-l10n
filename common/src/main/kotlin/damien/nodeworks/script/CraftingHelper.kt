@@ -131,6 +131,10 @@ object CraftingHelper {
     /** Set when [craft] submits an async craft to the scheduler. Callers await its completion. */
     var currentPendingJob: PendingHandlerJob? = null
 
+    /** The plan [craft] last submitted, the instance the CPU runs, so a caller can register
+     *  listeners on it. Cleared with [currentPendingJob]. */
+    var currentPlan: damien.nodeworks.script.cpu.CraftPlan? = null
+
     /** Source description for the last resolved processing handler. Retained for trace-log compat. */
     var lastHandlerSource: String? = null
 
@@ -185,9 +189,12 @@ object CraftingHelper {
          *  always use [ChannelFilter.All]. Default [ChannelFilter.All] preserves
          *  existing routing for Inventory Terminal / Lua callers. */
         outputChannel: damien.nodeworks.network.ChannelFilter = damien.nodeworks.network.ChannelFilter.All,
+        /** The block submitting this craft, recorded on the plan. See [CraftPlan.requester]. */
+        requesterPos: BlockPos? = null,
     ): CraftResult? {
         lastFailReason = null
         currentPendingJob = null
+        currentPlan = null
 
         if (count <= 0) {
             lastFailReason = "Craft count must be positive"
@@ -210,7 +217,9 @@ object CraftingHelper {
                 return null
             }
             if (!entity.isFormed) {
-                lastFailReason = "Crafting CPU at $cpuPos is not formed"
+                val driver = entity.drivenBy
+                lastFailReason = if (driver != null) "Crafting CPU at $cpuPos is on standby, the Core at $driver drives its structure"
+                    else "Crafting CPU at $cpuPos is not formed"
                 return null
             }
             // Feasibility still enforced on the explicit CPU
@@ -238,11 +247,14 @@ object CraftingHelper {
         // 4. Save the tree snapshot for the diagnostic GUI, then submit to the scheduler.
         cpu.craftTreeSnapshot = tree
         val pending = PendingHandlerJob()
-        val planWithSubmitter = if (submitterUuid != null) plan.copy(submitterUuid = submitterUuid) else plan
+        var planWithSubmitter = plan
+        if (submitterUuid != null) planWithSubmitter = planWithSubmitter.copy(submitterUuid = submitterUuid)
+        if (requesterPos != null) planWithSubmitter = planWithSubmitter.copy(requester = requesterPos)
         cpu.submitCraft(planWithSubmitter, level.gameTime) { success ->
             pending.complete(success)
         }
         currentPendingJob = pending
+        currentPlan = planWithSubmitter
 
         val outputName = resolveItemName(identifier)
         return CraftResult(

@@ -77,9 +77,23 @@ class ProcessingSet(properties: Properties) : Item(properties) {
             tooltip.accept(Component.literal("  Timeout: ${timeout}t (${timeout / 20.0}s)")
                 .withStyle(ChatFormatting.DARK_GRAY))
         }
+        context.registries()?.let { registries ->
+            val optional = getOutputs(stack, registries).filter { it.optional }
+            if (optional.isNotEmpty()) {
+                tooltip.accept(Component.literal("  Optional: " + optional.joinToString { it.stack.hoverName.string })
+                    .withStyle(ChatFormatting.DARK_GRAY))
+            }
+        }
         if (isFuzzy(stack)) {
-            tooltip.accept(Component.literal("  Fuzzy: any component variant matches")
+            tooltip.accept(Component.literal("  Substitutions: any tag member or component variant")
                 .withStyle(ChatFormatting.DARK_GRAY))
+            val registries = context.registries()
+            if (registries != null) {
+                for (ingr in getInputs(stack, registries)) {
+                    val tag = ingr.tag ?: continue
+                    tooltip.accept(Component.literal("  #$tag ×${ingr.count}").withStyle(ChatFormatting.DARK_GRAY))
+                }
+            }
         }
     }
 
@@ -101,16 +115,18 @@ class ProcessingSet(properties: Properties) : Item(properties) {
         // mirrors what the player set up in the GUI; sparse layouts
         // (a single ingredient in slot 4) read positionally instead of
         // bunching at the top-left.
-        val inputs = MutableList(damien.nodeworks.screen.tooltip.RecipeIconTooltip.INPUT_SLOTS) { ItemStack.EMPTY }
+        val inputs = MutableList(INPUT_GRID_SIZE) { ItemStack.EMPTY }
         for ((i, ingr) in rawInputs.withIndex()) {
             val slotIdx = inputSlots.getOrNull(i) ?: i
             if (slotIdx in inputs.indices) {
                 inputs[slotIdx] = ingr.stack.copyWithCount(ingr.count)
             }
         }
-        val outputs = getOutputs(stack, registries).map { it.stack.copyWithCount(it.count) }
+        val rawOutputs = getOutputs(stack, registries)
+        val outputs = rawOutputs.map { it.stack.copyWithCount(it.count) }
+        val optional = rawOutputs.withIndex().filter { it.value.optional }.map { it.index }.toSet()
         if (inputs.all { it.isEmpty } && outputs.isEmpty()) return java.util.Optional.empty()
-        return java.util.Optional.of(damien.nodeworks.screen.tooltip.RecipeIconTooltip(inputs, outputs))
+        return java.util.Optional.of(damien.nodeworks.screen.tooltip.RecipeIconTooltip(inputs, outputs, optional))
     }
 
     companion object {
@@ -122,6 +138,8 @@ class ProcessingSet(properties: Properties) : Item(properties) {
         private const val ENTRY_STACK_KEY = "stack"
         private const val ENTRY_COUNT_KEY = "count"
         private const val ENTRY_SLOT_KEY = "slot"
+        private const val ENTRY_TAG_KEY = "tag"
+        private const val ENTRY_OPTIONAL_KEY = "optional"
 
         // v1 NBT keys, still read for backward compatibility. Migrated to v2
         // shape (with empty components) on the next save.
@@ -136,8 +154,11 @@ class ProcessingSet(properties: Properties) : Item(properties) {
         private const val TIMEOUT_KEY = "timeout"
         private const val SERIAL_KEY = "serial"
         private const val FUZZY_KEY = "fuzzy"
-        const val MAX_OUTPUTS = 3
-        const val INPUT_GRID_SIZE = 9
+        /** A set holds up to 27 inputs on a 3 wide by 9 tall grid and up to 9 outputs. Cards
+         *  saved before the grid grew use positions 0 to 8 and 0 to 2 and load unchanged. */
+        const val INPUT_COLS = 3
+        const val MAX_OUTPUTS = 9
+        const val INPUT_GRID_SIZE = 27
 
         /** The card's display name. Cosmetic only after the canonical-id retire,
          *  recipe identity is the hash, not the name. */
@@ -202,9 +223,10 @@ class ProcessingSet(properties: Properties) : Item(properties) {
             return customData.copyTag().getBooleanOr(SERIAL_KEY, false)
         }
 
-        /** True when the recipe accepts any component variant of its declared
-         *  inputs (e.g. any potion in the input slot, not specifically a
-         *  Potion of Strength). Default false = exact-component matching. */
+        /** True when the recipe accepts substitutions: any member of a tag input's
+         *  tag, and any component variant of every input. Shown as "Substitutions" in
+         *  the editor, kept under the fuzzy key so existing recipe ids don't change.
+         *  Default false = exact matching. */
         fun isFuzzy(stack: ItemStack): Boolean {
             val customData = stack.get(DataComponents.CUSTOM_DATA) ?: return false
             return customData.copyTag().getBooleanOr(FUZZY_KEY, false)
@@ -286,6 +308,8 @@ class ProcessingSet(properties: Properties) : Item(properties) {
                 entry.put(ENTRY_STACK_KEY, stackTag)
                 entry.putInt(ENTRY_COUNT_KEY, ingr.count.coerceAtLeast(1))
                 entry.putInt(ENTRY_SLOT_KEY, slotsOverride?.getOrElse(i) { i } ?: i)
+                ingr.tag?.let { entry.putString(ENTRY_TAG_KEY, it) }
+                if (ingr.optional) entry.putBoolean(ENTRY_OPTIONAL_KEY, true)
                 list.add(entry)
             }
             return list
@@ -317,7 +341,9 @@ class ProcessingSet(properties: Properties) : Item(properties) {
                     val ingrStack = ItemStack.CODEC.parse(ops, stackTag).result().orElse(null) ?: continue
                     if (ingrStack.isEmpty) continue
                     val count = entry.getInt(ENTRY_COUNT_KEY).orElse(1).coerceAtLeast(1)
-                    out.add(RecipeIngredient(ingrStack, count))
+                    val tag = entry.getStringOr(ENTRY_TAG_KEY, "").takeIf { it.isNotEmpty() }
+                    val optional = entry.getBooleanOr(ENTRY_OPTIONAL_KEY, false)
+                    out.add(RecipeIngredient(ingrStack, count, tag, optional))
                 }
                 return out
             }

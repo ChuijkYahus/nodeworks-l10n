@@ -109,8 +109,23 @@ data class ServerSafetySettings(
      *  through the same helper). Independent of [maxItemMoveCallsPerTick]
      *  (a single call can move 64 items, so call count != item count).
      *  When this is exhausted, `tryInsert` returns partial counts and atomic
-     *  `insert` short-circuits to false. 0 means unlimited. */
-    val maxItemsMovedPerTickPerNetwork: Long = 0,
+     *  `insert` short-circuits to false. 0 means the default of 16384, 256 full
+     *  stacks per tick, enough to drain big storage in seconds while keeping
+     *  any one tick cheap. */
+    val maxItemsMovedPerTickPerNetwork: Long = 16384,
+
+    /** Max items one importer or stocker run moves. Separate from the script limit
+     *  above, each preset gets its own allowance per run. A run that hits it stops
+     *  and the rest moves on later runs, like a `tryInsert` in a loop. 0, or anything
+     *  above 16384, means 16384, so one run's work stays bounded. */
+    val maxItemsPerPresetRun: Long = 8192,
+
+    /** Wall-clock time per tick per network that `tryInsert` moves may use, and the
+     *  time each importer or stocker run gets. A move that runs out stops and keeps what
+     *  already moved, so moving everything out of a huge storage is spread over ticks
+     *  however the storage is built. Can't be turned off, this is the backstop for storages
+     *  slow enough that even [maxItemsMovedPerTickPerNetwork] items take too long. */
+    val maxItemMoveMsPerTickPerNetwork: Long = 10,
 
     /** Max simultaneously-registered callbacks per kind, per engine. Each kind
      *  (scheduler tasks, redstone handlers, observer handlers, processing
@@ -124,6 +139,11 @@ data class ServerSafetySettings(
      *  of which fires on its own schedule, eventually saturating the per-tick
      *  budget AND building up unbounded memory. */
     val maxCallbacksPerKind: Int = 256,
+
+    /** Processing Sets one Multi-Processing Handler may own. Each bound set is one
+     *  registry entry and one row in its GUI, so the cap is about keeping a single
+     *  block's picker and its open packet reasonable, not about server load. */
+    val multiHandlerMaxSets: Int = 16,
 
     /** Set of optional Lua standard libraries to load on engine startup. Default
      *  contains the full set of currently-shipped libs so vanilla / trusted
@@ -145,6 +165,12 @@ data class ServerSafetySettings(
      *    `"Network:insert"`, `"CardHandle:insert"`, `"PlacerHandle:place"`,
      *    `"VariableHandle:set"`, `"RedstoneCard:set"`, `"Scheduler:tick"`. */
     val disabledMethods: Set<String> = emptySet(),
+
+    /** Block ids and `#namespace:tag` patterns whose block entity data
+     *  `ObserverCard:data()` refuses to read. For blocks an admin doesn't want
+     *  scripts to see the internals of, while keeping `data()` on for the rest.
+     *  Resolved by [ObserverDenyList]. Empty by default, nothing is excluded. */
+    val observerDeniedBlocks: List<String> = emptyList(),
 
     /** Item ids and `#namespace:tag` patterns the User device refuses to drive.
      *  Stops automation from spamming food consumption (auto-feed exploits) or

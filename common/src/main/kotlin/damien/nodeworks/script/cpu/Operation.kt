@@ -61,6 +61,9 @@ sealed class Operation {
         val itemId: String,
         val amount: Long,
         val componentsPatch: net.minecraft.core.component.DataComponentPatch? = null,
+        /** Take only stacks whose components equal [componentsPatch], a plain one included.
+         *  Without it a plain pull takes any variant of the item. */
+        val exactVariant: Boolean = false,
     ) : Operation() {
         override val baseCost: Int get() = CpuRules.PULL_BASE_COST
 
@@ -86,7 +89,10 @@ sealed class Operation {
         override val dependsOn: List<Int>,
         val processingApiName: String,
         val inputs: List<Pair<String, Long>>,
-        val outputs: List<Pair<String, Long>>
+        val outputs: List<Pair<String, Long>>,
+        /** With substitutions, the concrete item per recipe input this op runs with,
+         *  parallel to the recipe's inputs. Null runs the recipe's own inputs. */
+        val resolvedInputs: List<damien.nodeworks.script.RecipeIngredient>? = null,
     ) : Operation() {
         override val baseCost: Int get() = CpuRules.PROCESS_BASE_COST
     }
@@ -100,7 +106,11 @@ sealed class Operation {
         val recipe: List<String>,
         val outputItemId: String,
         val outputCount: Long,
-        val executions: Long
+        val executions: Long,
+        /** The nine slots as stacks, parallel to [recipe], when a slot keeps components
+         *  the recipe needs. Empty means every slot is the plain item of its id, which is
+         *  also how plans saved before the stacks were kept read. */
+        val recipeStacks: List<net.minecraft.world.item.ItemStack> = emptyList(),
     ) : Operation() {
         override val baseCost: Int get() = CpuRules.EXECUTE_BASE_COST
     }
@@ -118,6 +128,11 @@ sealed class Operation {
         val outputChannel: damien.nodeworks.network.ChannelFilter = damien.nodeworks.network.ChannelFilter.All,
     ) : Operation() {
         override val baseCost: Int get() = CpuRules.DELIVER_BASE_COST
+
+        /** Root items already moved to storage ahead of this op, see the executor's
+         *  trickle. The op itself moves only `amount - delivered`. Saved with the op so a
+         *  reload neither re-delivers nor loses the count, plans saved before read zero. */
+        var delivered: Long = 0L
     }
 
     // =====================================================================
@@ -136,6 +151,7 @@ sealed class Operation {
                 tag.putString("kind", "pull")
                 tag.putString("itemId", itemId)
                 tag.putLong("amount", amount)
+                if (exactVariant) tag.putBoolean("exact", true)
                 // Persist the patch (registry-id encoded), not the hash.
                 val patch = componentsPatch
                 if (patch != null && patch.size() > 0) {
@@ -152,6 +168,19 @@ sealed class Operation {
                 tag.putString("api", processingApiName)
                 writeItemList(tag, "inputs", inputs)
                 writeItemList(tag, "outputs", outputs)
+                resolvedInputs?.let { resolved ->
+                    val ops = net.minecraft.resources.RegistryOps.create(net.minecraft.nbt.NbtOps.INSTANCE, registries)
+                    val list = ListTag()
+                    for (ingr in resolved) {
+                        val c = CompoundTag()
+                        val stackTag = net.minecraft.world.item.ItemStack.CODEC
+                            .encodeStart(ops, ingr.stack.copyWithCount(1)).result().orElse(null) ?: continue
+                        c.put("stack", stackTag)
+                        c.putInt("ct", ingr.count)
+                        list.add(c)
+                    }
+                    tag.put("resolved", list)
+                }
             }
             is Execute -> {
                 tag.putString("kind", "execute")
@@ -161,12 +190,28 @@ sealed class Operation {
                 tag.putString("out", outputItemId)
                 tag.putLong("outCount", outputCount)
                 tag.putLong("executions", executions)
+                if (recipeStacks.any { !it.isEmpty && it.componentsPatch.size() > 0 }) {
+                    val ops = net.minecraft.resources.RegistryOps.create(net.minecraft.nbt.NbtOps.INSTANCE, registries)
+                    val list = ListTag()
+                    var complete = true
+                    for (s in recipeStacks) {
+                        val stackTag = net.minecraft.world.item.ItemStack.OPTIONAL_CODEC
+                            .encodeStart(ops, s.copyWithCount(1)).result().orElse(null)
+                        if (stackTag == null) {
+                            complete = false
+                            break
+                        }
+                        list.add(stackTag)
+                    }
+                    if (complete) tag.put("recipeStacks", list)
+                }
             }
             is Deliver -> {
                 tag.putString("kind", "deliver")
                 tag.putString("itemId", itemId)
                 tag.putLong("amount", amount)
                 tag.putBoolean("reserved", toReservedSlot)
+                if (delivered > 0L) tag.putLong("delivered", delivered)
                 // Default All → -1, omit the key for older-save compatibility.
                 if (outputChannel !is damien.nodeworks.network.ChannelFilter.All) {
                     tag.putInt("channel", outputChannel.toNbtInt())
@@ -204,12 +249,14 @@ sealed class Operation {
                         tag.getStringOr("itemId", ""),
                         tag.getLongOr("amount", 0L),
                         patch,
+                        tag.getBooleanOr("exact", false),
                     )
                 }
                 "process" -> Process(
                     id, deps, tag.getStringOr("api", ""),
                     readItemList(tag, "inputs"),
-                    readItemList(tag, "outputs")
+                    readItemList(tag, "outputs"),
+                    readResolvedInputs(tag, registries),
                 )
                 "execute" -> {
                     val rec = tag.getListOrEmpty("recipe")
@@ -218,7 +265,8 @@ sealed class Operation {
                         id, deps, recipe,
                         tag.getStringOr("out", ""),
                         tag.getLongOr("outCount", 0L),
-                        tag.getLongOr("executions", 0L)
+                        tag.getLongOr("executions", 0L),
+                        readRecipeStacks(tag, registries, recipe.size),
                     )
                 }
                 "deliver" -> Deliver(
@@ -227,7 +275,7 @@ sealed class Operation {
                     tag.getLongOr("amount", 0L),
                     tag.getBooleanOr("reserved", false),
                     damien.nodeworks.network.ChannelFilter.fromNbtInt(tag.getIntOr("channel", -1)),
-                )
+                ).also { it.delivered = tag.getLongOr("delivered", 0L).coerceAtLeast(0L) }
                 else -> return null
             }
             op.readyAt = readyAt
@@ -245,6 +293,47 @@ sealed class Operation {
                 list.add(c)
             }
             tag.put(key, list)
+        }
+
+        /** The saved grid stacks, or an empty list when absent, the wrong length or any entry
+         *  fails to parse, so the op falls back to plain items rather than a shifted grid. */
+        private fun readRecipeStacks(
+            tag: CompoundTag,
+            registries: net.minecraft.core.HolderLookup.Provider,
+            slots: Int,
+        ): List<net.minecraft.world.item.ItemStack> {
+            if (!tag.contains("recipeStacks")) return emptyList()
+            val ops = net.minecraft.resources.RegistryOps.create(net.minecraft.nbt.NbtOps.INSTANCE, registries)
+            val list = tag.getListOrEmpty("recipeStacks")
+            if (list.size != slots) return emptyList()
+            val out = ArrayList<net.minecraft.world.item.ItemStack>(list.size)
+            for (i in 0 until list.size) {
+                val stackTag = list.get(i) ?: return emptyList()
+                val stack = net.minecraft.world.item.ItemStack.OPTIONAL_CODEC.parse(ops, stackTag).result().orElse(null)
+                    ?: return emptyList()
+                out.add(stack)
+            }
+            return out
+        }
+
+        /** The saved substituted inputs, or null when absent or any entry fails to parse,
+         *  so the op never runs on a partial list. */
+        private fun readResolvedInputs(
+            tag: CompoundTag,
+            registries: net.minecraft.core.HolderLookup.Provider,
+        ): List<damien.nodeworks.script.RecipeIngredient>? {
+            if (!tag.contains("resolved")) return null
+            val ops = net.minecraft.resources.RegistryOps.create(net.minecraft.nbt.NbtOps.INSTANCE, registries)
+            val list = tag.getListOrEmpty("resolved")
+            val out = ArrayList<damien.nodeworks.script.RecipeIngredient>(list.size)
+            for (i in 0 until list.size) {
+                val c = list.getCompound(i).orElse(null) ?: return null
+                val stackTag = c.get("stack") ?: return null
+                val stack = net.minecraft.world.item.ItemStack.CODEC.parse(ops, stackTag).result().orElse(null) ?: return null
+                if (stack.isEmpty) return null
+                out.add(damien.nodeworks.script.RecipeIngredient(stack, c.getIntOr("ct", 1).coerceAtLeast(1)))
+            }
+            return out
         }
 
         private fun readItemList(tag: CompoundTag, key: String): List<Pair<String, Long>> {

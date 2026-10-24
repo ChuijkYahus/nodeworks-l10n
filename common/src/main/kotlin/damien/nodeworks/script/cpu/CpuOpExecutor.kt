@@ -10,6 +10,7 @@ import damien.nodeworks.script.ItemsHandle
 import damien.nodeworks.script.NetworkStorageHelper
 import damien.nodeworks.script.ProcessingJob
 import damien.nodeworks.script.ScriptEngine
+import net.minecraft.core.BlockPos
 import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.resources.Identifier
 import net.minecraft.server.level.ServerLevel
@@ -81,6 +82,9 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
      *  "the CPU is waiting for something" without being laggy. */
     private val RETRY_BACKOFF_TICKS = 20L
 
+    /** How long an op steps aside when its handler block is busy with another op. */
+    private val HANDLER_BUSY_BACKOFF_TICKS = 5L
+
     /** Per-op retry cap. Read live from the Network Controller for this CPU's network so
      *  players can tune it in the Controller GUI without a server restart. Falls back to
      *  50 if no Controller is reachable (legacy default). */
@@ -98,6 +102,272 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
      *  Fires exactly once when the plan reaches DONE or FAILED. */
     fun registerCompletionListener(plan: CraftPlan, onComplete: (Boolean) -> Unit) {
         completionListeners[plan] = onComplete
+    }
+
+    /** Told the running total of root items moved to storage ahead of the plan's end,
+     *  after each trickle. Removed with the completion listener on either exit. */
+    private val progressListeners = mutableMapOf<CraftPlan, (Long) -> Unit>()
+
+    fun registerProgressListener(plan: CraftPlan, onProgress: (Long) -> Unit) {
+        progressListeners[plan] = onProgress
+    }
+
+    /**
+     * Finished root items leave the buffer for storage while the plan still runs, so a
+     * long processing craft hands items over one by one instead of all at the end. Only
+     * the root item is moved, only up to what the trailing Deliver would move, and only
+     * for a plan in which no other op consumes the root item, since those ops need the
+     * buffer to hold it. The Deliver then moves whatever is left.
+     *
+     * A move runs when a full stack waits, or when [TRICKLE_INTERVAL] ticks passed and
+     * anything waits. It inserts into the card that took the last move first and walks
+     * the network only on a miss, so the cost does not grow with the network. When even
+     * the walk places nothing storage is full for this item, and the next attempt waits
+     * twice as long, up to [TRICKLE_MAX_BACKOFF], so a full network is not rescanned every
+     * second. Items storage refuses stay in the buffer.
+     */
+    private class TrickleState(val plan: CraftPlan, val deliver: Operation.Deliver, val maxStack: Int) {
+        var nextDueTick = 0L
+        var backoff = TRICKLE_INTERVAL
+        var home: damien.nodeworks.network.CardSnapshot? = null
+        /** Where [home] is mounted, read from the snapshot when it is chosen. A card's
+         *  face can be overridden by the player, so the Node is not derived from it. */
+        var homeNodePos: BlockPos? = null
+        var homeSide: net.minecraft.core.Direction? = null
+        var lastMoveTick = Long.MIN_VALUE / 2
+        /** Last tick a move went through the priority walk, see [resolveHome]. */
+        var lastWalkTick = Long.MIN_VALUE / 2
+        /** Highest priority among cards that take the root item, see [resolveHome]. */
+        var topPriority = Int.MIN_VALUE
+        var topPriorityTick = Long.MIN_VALUE / 2
+    }
+
+    /** Remembers [card] as the home with the Node and side it sits on, or forgets the
+     *  home when the snapshot does not list it. */
+    private fun setHome(state: TrickleState, card: damien.nodeworks.network.CardSnapshot, snapshot: damien.nodeworks.network.NetworkSnapshot) {
+        for (node in snapshot.nodes) {
+            for ((side, cards) in node.sides) {
+                if (cards.any { it === card }) {
+                    state.home = card
+                    state.homeNodePos = node.pos
+                    state.homeSide = side
+                    return
+                }
+            }
+        }
+        state.home = null
+    }
+
+    /** The card a move tries before the walk, with its storage resolved once. [usable]
+     *  drops to false when it refuses, so the rest of the move does not retry it. */
+    private class HomeTarget(val card: damien.nodeworks.network.CardSnapshot, val storage: damien.nodeworks.platform.ItemStorageHandle) {
+        var usable = true
+    }
+
+    /** One move's shared target, replaced when the walk finds a new card. */
+    private class MoveContext(val now: Long, var home: HomeTarget?)
+
+    private fun clearHome(state: TrickleState) {
+        state.home = null
+        state.homeNodePos = null
+        state.homeSide = null
+    }
+
+    /** The network's inventory cache for the running plan, resolved once per plan with the
+     *  one discovery walk the Deliver already paid, so pulls and trickles can report their
+     *  moves without a walk each. */
+    private var planCache: damien.nodeworks.script.NetworkInventoryCache? = null
+    private var planCacheFor: CraftPlan? = null
+
+    private fun cacheForPlan(lvl: ServerLevel, plan: CraftPlan): damien.nodeworks.script.NetworkInventoryCache {
+        if (planCacheFor === plan) planCache?.let { return it }
+        val c = damien.nodeworks.script.NetworkInventoryCache.getOrCreate(lvl, cpu.blockPos)
+        planCache = c
+        planCacheFor = plan
+        return c
+    }
+
+    /**
+     * The remembered card, when it is still worth trying first. Its settings are read
+     * live from its Node each move, so a priority or filter the player changed since the
+     * card was chosen applies to the next move, and a card that is gone is forgotten.
+     * Only a card that still takes [stack] is used. A card below the highest priority
+     * that takes the item is still used, since the walk that chose it found every card
+     * above it full, but once per [TRICKLE_PRIORITY_RECHECK] a move goes through the walk
+     * again so a higher card that has freed up takes over. Null sends the move through
+     * the walk.
+     */
+    private fun resolveHome(
+        state: TrickleState,
+        lvl: ServerLevel,
+        snapshot: damien.nodeworks.network.NetworkSnapshot,
+        channel: damien.nodeworks.network.ChannelFilter,
+        stack: ItemStack,
+        now: Long,
+    ): HomeTarget? {
+        val home = state.home ?: return null
+        val nodePos = state.homeNodePos
+        val side = state.homeSide
+        val remembered = home.capability as? damien.nodeworks.card.StorageSideCapability
+        if (nodePos == null || side == null || remembered == null || !lvl.isLoaded(nodePos)) {
+            clearHome(state)
+            return null
+        }
+        val node = lvl.getBlockEntity(nodePos) as? damien.nodeworks.block.entity.NodeBlockEntity
+        if (node == null || node.networkId != snapshot.networkId) {
+            clearHome(state)
+            return null
+        }
+        val info = node.getSideCapabilities(side).firstOrNull { it.slotIndex == home.slotIndex }
+        val cap = info?.capability as? damien.nodeworks.card.StorageSideCapability
+        if (cap == null || cap.adjacentPos != remembered.adjacentPos) {
+            clearHome(state)
+            return null
+        }
+        val live = damien.nodeworks.network.CardSnapshot(cap, info.alias, info.slotIndex, info.channel)
+        state.home = live
+        val registries = lvl.registryAccess()
+        if (!channel.matches(live.channel) || !cap.acceptsItem(stack, registries)) {
+            clearHome(state)
+            return null
+        }
+        // Priorities change rarely, by a player clicking a card, so the top is re-read
+        // once an interval. Cards come sorted by priority, so the first taker is the top.
+        if (now - state.topPriorityTick >= TRICKLE_INTERVAL) {
+            state.topPriorityTick = now
+            state.topPriority = snapshot.storageCards.firstOrNull { card ->
+                val c = card.capability as? damien.nodeworks.card.StorageSideCapability
+                c != null && channel.matches(card.channel) && c.acceptsItem(stack, registries)
+            }?.let { (it.capability as damien.nodeworks.card.StorageSideCapability).priority } ?: Int.MIN_VALUE
+        }
+        if (cap.priority < state.topPriority && now - state.lastWalkTick >= TRICKLE_PRIORITY_RECHECK) return null
+        val storage = NetworkStorageHelper.getStorage(lvl, live) ?: run {
+            clearHome(state)
+            return null
+        }
+        return HomeTarget(live, storage)
+    }
+
+    /** State for the running plan, or null when it does not trickle. Rebuilt when the
+     *  running plan changes, which also covers a plan resumed from NBT. */
+    private var trickle: TrickleState? = null
+    private var trickleResolvedFor: CraftPlan? = null
+
+    private fun trickleStateFor(plan: CraftPlan): TrickleState? {
+        if (trickleResolvedFor === plan) return trickle
+        trickleResolvedFor = plan
+        trickle = buildTrickleState(plan)
+        return trickle
+    }
+
+    private fun buildTrickleState(plan: CraftPlan): TrickleState? {
+        if (plan.omitDeliver) return null
+        val root = plan.rootItemId
+        val deliver = plan.ops.firstOrNull { it is Operation.Deliver && it.id in plan.terminalOpIds && it.itemId == root }
+            as? Operation.Deliver ?: return null
+        val rootConsumed = plan.ops.any { op ->
+            when (op) {
+                is Operation.Execute -> op.recipe.any { it == root }
+                is Operation.Process -> op.inputs.any { it.first == root }
+                else -> false
+            }
+        }
+        if (rootConsumed) return null
+        val item = Identifier.tryParse(root)?.let { BuiltInRegistries.ITEM.getValue(it) } ?: return null
+        return TrickleState(plan, deliver, item.getDefaultMaxStackSize())
+    }
+
+    private fun runTrickle() {
+        val plan = cpu.scheduler.currentPlan
+        if (plan == null) {
+            trickle = null
+            trickleResolvedFor = null
+            return
+        }
+        val state = trickleStateFor(plan) ?: return
+        val deliver = state.deliver
+        val remaining = deliver.amount - deliver.delivered
+        if (remaining <= 0L) return
+        // Only the plain bucket moves early, read and removed by its own key, so a
+        // variant of the root item waiting in the buffer is never swapped for a plain
+        // copy. The Deliver treats a variant-only buffer the way it always has.
+        val plainKey = damien.nodeworks.script.BufferKey.Key(deliver.itemId, "")
+        val inBuffer = cpu.getBufferCount(plainKey)
+        if (inBuffer <= 0L) return
+        val lvl = cpu.level as? ServerLevel ?: return
+        val now = lvl.gameTime
+        val fullStackWaiting = inBuffer >= state.maxStack && state.backoff == TRICKLE_INTERVAL &&
+            now - state.lastMoveTick >= TRICKLE_MIN_GAP
+        if (now < state.nextDueTick && !fullStackWaiting) return
+        val template = cpu.getBufferTemplate(plainKey)?.takeIf { !it.isEmpty } ?: return
+        val snapshot = snapshotForTick(lvl)
+        val cache = cacheForPlan(lvl, plan)
+        val ctx = MoveContext(now, resolveHome(state, lvl, snapshot, deliver.outputChannel, template, now))
+        var moved = 0L
+        var want = minOf(inBuffer, remaining)
+        damien.nodeworks.platform.MoveDeadline.within(TRICKLE_BUDGET_NANOS) {
+            var stacks = 0
+            while (want > 0L && stacks < TRICKLE_MAX_STACKS) {
+                val batch = minOf(want, state.maxStack.toLong()).toInt()
+                // Insert first, then take what landed out of the buffer, so storage
+                // refusing costs nothing and drops nothing.
+                val inserted = insertToStorage(template.copyWithCount(batch), lvl, snapshot, deliver.outputChannel, state, cache, ctx)
+                if (inserted <= 0) break
+                val taken = cpu.removeFromBuffer(plainKey, inserted.toLong())
+                moved += taken
+                want -= taken
+                stacks++
+                if (taken < inserted) break
+                if (damien.nodeworks.platform.MoveDeadline.expired()) break
+            }
+        }
+        if (moved > 0L) {
+            deliver.delivered += moved
+            cpu.setChanged()
+            state.backoff = TRICKLE_INTERVAL
+            state.lastMoveTick = now
+            progressListeners[plan]?.invoke(deliver.delivered)
+        } else {
+            state.backoff = minOf(state.backoff * 2, TRICKLE_MAX_BACKOFF)
+        }
+        state.nextDueTick = now + state.backoff
+    }
+
+    /** Inserts [stack] into network storage on [channel]. The move's home card is tried
+     *  first while it keeps taking, the walk runs on a miss and the card it lands on
+     *  becomes the home for the rest of this move and the next. Returns what landed. */
+    private fun insertToStorage(
+        stack: ItemStack,
+        lvl: ServerLevel,
+        snapshot: damien.nodeworks.network.NetworkSnapshot,
+        channel: damien.nodeworks.network.ChannelFilter,
+        state: TrickleState?,
+        cache: damien.nodeworks.script.NetworkInventoryCache?,
+        ctx: MoveContext,
+    ): Int {
+        val home = ctx.home?.takeIf { it.usable }
+        var landed = 0
+        if (home != null) {
+            val inserted = PlatformServices.storage.insertItemStack(home.storage, stack.copy())
+            if (inserted > 0) {
+                val itemId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
+                if (itemId != null && cache != null) {
+                    cache.onInserted(itemId, !stack.componentsPatch.isEmpty, inserted.toLong(), stack.componentsPatch)
+                    cache.onChannelDelta(home.card.channel, itemId, stack.componentsPatch, inserted.toLong())
+                }
+                if (inserted >= stack.count) return inserted
+                landed = inserted
+            }
+            home.usable = false
+        }
+        val rest = stack.copyWithCount(stack.count - landed)
+        state?.lastWalkTick = ctx.now
+        val walked = NetworkStorageHelper.insertItemStack(lvl, snapshot, rest, cache, channel, onPlaced = { card ->
+            if (state != null) setHome(state, card, snapshot)
+            val storage = NetworkStorageHelper.getStorage(lvl, card)
+            ctx.home = if (storage != null) HomeTarget(card, storage) else null
+        })
+        return landed + walked
     }
 
     /** Read live from the CPU so heat/cooling changes (placing/breaking Stabilizers) take
@@ -121,6 +391,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
     }
 
     override fun onTickEnd() {
+        runTrickle()
         cachedSnapshot = null
         insideTick = false
     }
@@ -174,7 +445,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // would pick up any first-found potion variant and the Process op's
         // feasibility check (which keys on the recipe's variant bucket) would
         // fail. Plain Pulls (empty hash) fall back to the itemId-only filter.
-        val variantSensitive = op.componentsHash.isNotEmpty()
+        val variantSensitive = op.componentsHash.isNotEmpty() || op.exactVariant
         for (card in NetworkStorageHelper.getStorageCards(snapshot)) {
             if (remaining <= 0L) break
             val storage = NetworkStorageHelper.getStorage(lvl, card) ?: continue
@@ -191,6 +462,9 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             for (stack in extractedStacks) {
                 if (stack.isEmpty) continue
                 val amount = stack.count.toLong()
+                // Read before the buffer takes the stack, an emptied stack reports nothing.
+                val pulledId = BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
+                val pulledPatch = stack.componentsPatch
                 if (!cpu.addToBuffer(stack, amount)) {
                     // Buffer refused, this shouldn't happen if feasibility passed,
                     // but if it does, put the extracted back and fail cleanly.
@@ -198,6 +472,12 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
                     return CraftScheduler.OpResult.Failed(
                         "Buffer refused $amount ${op.itemId} (full)"
                     )
+                }
+                // The grid shows the pull at once instead of after the next poll.
+                if (pulledId != null) {
+                    val cache = cpu.scheduler.currentPlan?.let { cacheForPlan(lvl, it) }
+                    cache?.onExtracted(pulledId, !pulledPatch.isEmpty, amount, pulledPatch)
+                    cache?.onChannelDelta(card.channel, pulledId, pulledPatch, -amount)
                 }
                 remaining -= amount
             }
@@ -221,19 +501,27 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
     ): CraftScheduler.OpResult {
         val recipeManager = lvl.recipeAccess() ?: return CraftScheduler.OpResult.Failed("No recipe manager")
 
-        val ingredientCounts = mutableMapOf<String, Int>()
-        for (id in op.recipe) if (id.isNotEmpty()) ingredientCounts.merge(id, 1, Int::plus)
-
-        val items = op.recipe.map { itemId ->
-            if (itemId.isEmpty()) ItemStack.EMPTY
-            else {
-                val id = Identifier.tryParse(itemId)
-                    ?: return CraftScheduler.OpResult.Failed("Bad item id in recipe: $itemId")
-                val item = BuiltInRegistries.ITEM.getValue(id)
-                    ?: return CraftScheduler.OpResult.Failed("Unknown item in recipe: $itemId")
-                ItemStack(item, 1)
+        // The grid as stacks. A slot kept with components is that variant, every other
+        // slot is the plain item of its id, which is also how older plans read.
+        val items = ArrayList<ItemStack>(op.recipe.size)
+        for ((slot, itemId) in op.recipe.withIndex()) {
+            if (itemId.isEmpty()) {
+                items.add(ItemStack.EMPTY)
+                continue
             }
+            val id = Identifier.tryParse(itemId)
+                ?: return CraftScheduler.OpResult.Failed("Bad item id in recipe: $itemId")
+            val item = BuiltInRegistries.ITEM.getValue(id)
+                ?: return CraftScheduler.OpResult.Failed("Unknown item in recipe: $itemId")
+            val kept = op.recipeStacks.getOrNull(slot)
+            items.add(if (kept != null && !kept.isEmpty && kept.item === item) kept.copyWithCount(1) else ItemStack(item, 1))
         }
+        // What each slot takes from the buffer, a variant bucket for a slot kept with
+        // components and the plain bucket for the rest.
+        val slotKeys: List<damien.nodeworks.script.BufferKey.Key?> =
+            items.map { if (it.isEmpty) null else damien.nodeworks.script.BufferKey.of(it) }
+        val ingredientCounts = mutableMapOf<damien.nodeworks.script.BufferKey.Key, Int>()
+        for (key in slotKeys) if (key != null) ingredientCounts.merge(key, 1, Int::plus)
         val craftingInput = CraftingInput.of(3, 3, items)
         val recipeHolder = recipeManager
             .getRecipeFor(RecipeType.CRAFTING, craftingInput, lvl)
@@ -253,28 +541,186 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         val perBatch = expected.getCount().coerceAtLeast(1).toLong()
         val desired = op.outputCount.coerceAtLeast(1L)
         val executions = ((desired + perBatch - 1) / perBatch).coerceAtLeast(1L)
-        var done = 0L
-        while (done < executions) {
-            // Consume ingredients
-            for ((ing, needed) in ingredientCounts) {
-                val removed = cpu.removeFromBuffer(ing, needed.toLong())
-                if (removed < needed) {
-                    // Partial failure, put back what we already consumed this iteration, abort
-                    cpu.addToBuffer(ing, removed)
+        // What a recipe hands back, like an empty bucket or a worn crystal. A leftover that is
+        // one of the recipe's own ingredients is used again by the next craft, the way it stays
+        // in a player's grid. Everything else, and whatever is still held at the end, goes
+        // straight to network storage in one pass, so leftovers never fill the CPU buffer.
+        val held = mutableMapOf<damien.nodeworks.script.BufferKey.Key, ArrayDeque<ItemStack>>()
+        val spare = LinkedHashMap<damien.nodeworks.script.BufferKey.Key, Pair<ItemStack, Long>>()
+        fun keepLeftover(stack: ItemStack) {
+            if (stack.isEmpty) return
+            val key = damien.nodeworks.script.BufferKey.of(stack)
+            val prev = spare[key]
+            spare[key] = (prev?.first ?: stack.copyWithCount(1)) to ((prev?.second ?: 0L) + stack.count)
+        }
+        // Ingredients taken for the craft in progress, returned if anything throws before it lands.
+        var inHand: Array<ItemStack?>? = null
+        var inStandby: Array<ItemStack?>? = null
+        // Fresh ingredients a craft in this op used that the recipe gave nothing back for. Only
+        // an empty answer is ever reused, and only for the exact same stacks, so skipping the
+        // lookup can never invent a leftover or drop one the recipe would have given.
+        var noLeftoversFor: List<ItemStack?>? = null
+        try {
+            var done = 0L
+            while (done < executions) {
+                // Real stacks per slot, so leftovers come from the actual item (a crystal keeps its wear).
+                val taken = arrayOfNulls<ItemStack>(op.recipe.size)
+                // Slots holding a worn copy or a reused leftover rather than a fresh one.
+                val worn = BooleanArray(op.recipe.size)
+                // Fresh copies taken alongside a reused leftover, see below.
+                val standby = arrayOfNulls<ItemStack>(op.recipe.size)
+                inHand = taken
+                inStandby = standby
+                fun underflow(ing: damien.nodeworks.script.BufferKey.Key): CraftScheduler.OpResult {
+                    val had = taken.count { it != null && BuiltInRegistries.ITEM.getKey(it.item).toString() == ing.itemId }
+                    inHand = null
+                    inStandby = null
+                    for (s in taken) if (s != null) keepLeftover(s)
+                    for (s in standby) if (s != null) keepLeftover(s)
                     return CraftScheduler.OpResult.Failed(
-                        "Execute iteration underflow: $ing x$needed (had $removed)"
+                        "Execute iteration underflow: ${ing.itemId} x${ingredientCounts[ing]} (had $had)"
                     )
                 }
+                for ((slot, ing) in slotKeys.withIndex()) {
+                    if (ing == null) continue
+                    val reused = held[ing]?.removeFirstOrNull()
+                    if (reused != null) {
+                        taken[slot] = reused
+                        worn[slot] = true
+                        // Still take the fresh copy planned for this craft, so the buffer drains as it
+                        // would without reuse and spare copies never crowd out the outputs. It goes to
+                        // storage, unless the reused one is turned down below and it is used instead.
+                        standby[slot] = takeIngredient(ing, allowWorn = false)?.first
+                        continue
+                    }
+                    val (stack, fresh) = takeIngredient(ing, allowWorn = true) ?: return underflow(ing)
+                    taken[slot] = stack
+                    worn[slot] = !fresh
+                }
+                // The output was worked out from fresh ingredients. If a worn copy would change it,
+                // like repairing damaged tools, those slots take fresh copies instead.
+                if (worn.any { it } && !craftsAsPlanned(recipeHolder.value(), taken, expected, lvl)) {
+                    for ((slot, ing) in slotKeys.withIndex()) {
+                        if (ing == null || !worn[slot]) continue
+                        taken[slot]?.let { keepLeftover(it) }
+                        taken[slot] = null
+                        taken[slot] = standby[slot]?.also { standby[slot] = null }
+                            ?: takeIngredient(ing, allowWorn = false)?.first
+                            ?: return underflow(ing)
+                    }
+                }
+                for (i in standby.indices) {
+                    standby[i]?.let { keepLeftover(it) }
+                    standby[i] = null
+                }
+                inStandby = null
+                val output = expected.copyWithCount(expected.getCount())
+                // Keeps the recipe's components, the bucket stays plain.
+                val landed = cpu.addCraftedToBuffer(expectedItemId, output, output.getCount().toLong())
+                inHand = null
+                if (!landed) {
+                    for (s in taken) if (s != null) keepLeftover(s)
+                    return CraftScheduler.OpResult.Failed(
+                        "Buffer refused crafted $expectedItemId x${output.getCount()}"
+                    )
+                }
+                val allFresh = worn.none { it }
+                val leftovers: List<ItemStack> = if (allFresh && noLeftoversFor?.let { sameStacks(it, taken) } == true) {
+                    emptyList()
+                } else {
+                    // Copied before asking, in case a recipe changes its input stacks.
+                    val asked = if (allFresh) taken.map { it?.copy() } else null
+                    val result = try {
+                        recipeHolder.value().getRemainingItems(CraftingInput.of(3, 3, taken.map { it ?: ItemStack.EMPTY }))
+                    } catch (e: Exception) {
+                        logger.warn("Leftovers for {} threw, none kept: {}", expectedItemId, e.message)
+                        null
+                    }
+                    // A throw is not an answer, so only a real empty result is remembered.
+                    if (asked != null && result != null && result.all { it.isEmpty }) noLeftoversFor = asked
+                    result ?: emptyList()
+                }
+                for (left in leftovers) {
+                    if (left.isEmpty) continue
+                    // Back to its own variant slot when the recipe has one, else to a plain
+                    // slot of the same item, where a worn copy is as welcome as it always was.
+                    val leftKey = damien.nodeworks.script.BufferKey.of(left)
+                    val slotKey = if (leftKey in ingredientCounts) leftKey
+                        else ingredientCounts.keys.firstOrNull { it.isPlain && it.itemId == leftKey.itemId }
+                    if (slotKey != null) held.getOrPut(slotKey) { ArrayDeque() }.addLast(left)
+                    else keepLeftover(left)
+                }
+                done++
             }
-            val output = expected.copyWithCount(expected.getCount())
-            if (!cpu.addToBuffer(expectedItemId, output.getCount().toLong())) {
-                return CraftScheduler.OpResult.Failed(
-                    "Buffer refused crafted $expectedItemId x${output.getCount()}"
-                )
+            return CraftScheduler.OpResult.Completed
+        } finally {
+            inHand?.forEach { if (it != null) keepLeftover(it) }
+            inStandby?.forEach { if (it != null) keepLeftover(it) }
+            for (stacks in held.values) for (s in stacks) keepLeftover(s)
+            if (spare.isNotEmpty()) {
+                val snap = snapshotForTick(lvl)
+                for ((template, count) in spare.values) tryReturnStackToStorage(template, count, lvl, snap)
             }
-            done++
         }
-        return CraftScheduler.OpResult.Completed
+    }
+
+    /** True when [taken] still matches [recipe] and crafts exactly [expected]. */
+    private fun craftsAsPlanned(
+        recipe: net.minecraft.world.item.crafting.CraftingRecipe,
+        taken: Array<ItemStack?>,
+        expected: ItemStack,
+        lvl: ServerLevel,
+    ): Boolean = try {
+        val input = CraftingInput.of(3, 3, taken.map { it ?: ItemStack.EMPTY })
+        recipe.matches(input, lvl) && recipe.assemble(input).let {
+            it.count == expected.count && ItemStack.isSameItemSameComponents(it, expected)
+        }
+    } catch (e: Exception) {
+        false
+    }
+
+    /** One item for [slotKey] out of the buffer as a real stack, paired with true when it is
+     *  a fresh copy. Its own bucket goes first, then, for a plain slot with [allowWorn], a
+     *  copy that differs only by wear, so a worn crystal back in storage still crafts. A
+     *  renamed or enchanted copy is never used up, and a slot kept with components takes
+     *  that variant alone. */
+    private fun takeIngredient(slotKey: damien.nodeworks.script.BufferKey.Key, allowWorn: Boolean): Pair<ItemStack, Boolean>? {
+        val itemId = slotKey.itemId
+        takeOne(slotKey, itemId)?.let { return it to true }
+        if (!allowWorn || !slotKey.isPlain) return null
+        for ((key, entry) in cpu.bufferState.contents()) {
+            if (key.itemId != itemId || key.isPlain) continue
+            val patch = entry.template.componentsPatch
+            if (patch.size() == 0 || !patch.entrySet().all { it.key == net.minecraft.core.component.DataComponents.DAMAGE }) continue
+            takeOne(key, itemId)?.let { return it to false }
+        }
+        return null
+    }
+
+    /** One item out of [key]'s bucket as a real stack. Built before removing, so an item that
+     *  can't be rebuilt is never taken. */
+    private fun takeOne(key: damien.nodeworks.script.BufferKey.Key, itemId: String): ItemStack? {
+        if (cpu.getBufferCount(key) <= 0L) return null
+        val stack = cpu.getBufferTemplate(key)?.takeIf { !it.isEmpty }?.copyWithCount(1)
+            ?: Identifier.tryParse(itemId)?.let { BuiltInRegistries.ITEM.getValue(it) }?.let { ItemStack(it, 1) }
+            ?: return null
+        if (cpu.removeFromBuffer(key, 1L) < 1L) return null
+        return stack
+    }
+
+    /** True when both grids hold the same item, components and count in every slot. */
+    private fun sameStacks(a: List<ItemStack?>, b: Array<ItemStack?>): Boolean {
+        if (a.size != b.size) return false
+        for (i in b.indices) {
+            val x = a[i]
+            val y = b[i]
+            if (x == null || y == null) {
+                if (x != null || y != null) return false
+                continue
+            }
+            if (x.count != y.count || !ItemStack.isSameItemSameComponents(x, y)) return false
+        }
+        return true
     }
 
     // =====================================================================
@@ -286,13 +732,18 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         lvl: ServerLevel,
         snapshot: damien.nodeworks.network.NetworkSnapshot
     ): CraftScheduler.OpResult {
+        // Whatever the trickle already moved is not owed again.
+        val owed = (op.amount - op.delivered).coerceAtLeast(0L)
+        if (owed == 0L) return CraftScheduler.OpResult.Completed
+        // Read before removing, the bucket goes away once drained.
+        val template = cpu.getBufferTemplate(damien.nodeworks.script.BufferKey.Key(op.itemId, ""))
         val inBuffer = cpu.getBufferCount(op.itemId)
-        if (inBuffer < op.amount) {
+        if (inBuffer < owed) {
             return CraftScheduler.OpResult.Failed(
-                "Deliver wanted ${op.amount} of ${op.itemId} but buffer has $inBuffer"
+                "Deliver wanted $owed of ${op.itemId} but buffer has $inBuffer"
             )
         }
-        val removed = cpu.removeFromBuffer(op.itemId, op.amount)
+        val removed = cpu.removeFromBuffer(op.itemId, owed)
         val id = Identifier.tryParse(op.itemId)
             ?: return CraftScheduler.OpResult.Failed("Bad item id: ${op.itemId}")
         val item = BuiltInRegistries.ITEM.getValue(id)
@@ -304,13 +755,18 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // queued craft's reserved-row claim subtracted reservations from a
         // stale cache count - displaying 0 stock during the gap until the
         // poll caught up.
+        // Update the network's inventory cache as items land so the Inventory
+        // Terminal's grid count reflects the post-Deliver storage immediately.
         val deliverCache = damien.nodeworks.script.NetworkInventoryCache.getOrCreate(lvl, cpu.blockPos)
+        val state = trickle?.takeIf { it.deliver === op }
+        val sample = template?.takeIf { it.item == item }?.copyWithCount(1) ?: ItemStack(item)
+        val ctx = MoveContext(lvl.gameTime, state?.let { resolveHome(it, lvl, snapshot, op.outputChannel, sample, lvl.gameTime) })
         var remaining = removed
         var droppedCount = 0L
         while (remaining > 0L) {
             val batch = minOf(remaining, item.getDefaultMaxStackSize().toLong()).toInt()
-            val stack = ItemStack(item, batch)
-            val inserted = NetworkStorageHelper.insertItemStack(lvl, snapshot, stack, deliverCache, op.outputChannel)
+            val stack = template?.takeIf { it.item == item }?.copyWithCount(batch) ?: ItemStack(item, batch)
+            val inserted = insertToStorage(stack, lvl, snapshot, op.outputChannel, state, deliverCache, ctx)
             if (inserted == 0) {
                 // Network storage refused, drop the batch on the ground so the finished
                 // items aren't destroyed, and track how many we had to drop. We still fail
@@ -322,7 +778,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
                     "Deliver: network storage refused {}, dropping {} in-world at {}",
                     op.itemId, batch, cpu.blockPos
                 )
-                val dropStack = ItemStack(item, batch)
+                val dropStack = stack.copy()
                 net.minecraft.world.Containers.dropItemStack(
                     lvl, cpu.blockPos.x + 0.5, cpu.blockPos.y + 1.0, cpu.blockPos.z + 0.5, dropStack
                 )
@@ -353,6 +809,15 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         data class Insufficient(val message: String) : BatchSetup()
     }
 
+    /** The inputs this op runs with: the planner's substitutions when it made any,
+     *  otherwise the recipe's own. A saved list that no longer lines up with the recipe
+     *  is ignored rather than trusted. */
+    private fun effectiveInputs(
+        op: Operation.Process,
+        api: damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo,
+    ): List<damien.nodeworks.script.RecipeIngredient> =
+        op.resolvedInputs?.takeIf { it.size == api.inputs.size } ?: api.inputs
+
     /** Resolve (or build + cache) the per-op [BatchProgress] for a processing
      *  recipe. Shared by the Lua handler path ([executeProcess]) and the
      *  block handler path ([executeBlockHandler]) so the buffer pre-check
@@ -365,7 +830,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         processBatchProgress[op.id]?.let { return BatchSetup.Ok(it) }
         val outputTotal = op.outputs.first().second
         val outputPerBatch = apiMatch.api.outputs
-            .firstOrNull { it.itemId == outputItemId }?.count?.toLong()?.coerceAtLeast(1L)
+            .firstOrNull { !it.optional && it.itemId == outputItemId }?.count?.toLong()?.coerceAtLeast(1L)
             ?: 1L
         // Feasibility check: sum each recipe input across slots (handles
         // duplicates like 2× iron) and require that much in the variant-
@@ -375,7 +840,8 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // Strength Potions checks the (potion, <strength-hash>) bucket, not
         // the generic potion bucket.
         val perKeyInputs = LinkedHashMap<damien.nodeworks.script.BufferKey.Key, Long>()
-        for (ingr in apiMatch.api.inputs) {
+        val inputs = effectiveInputs(op, apiMatch.api)
+        for (ingr in inputs) {
             val key = ingr.bufferKey()
             perKeyInputs[key] = (perKeyInputs[key] ?: 0L) + ingr.count.toLong()
         }
@@ -390,20 +856,26 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         val progress = if (apiMatch.api.serial) {
             // Serial: one handler invocation per batch. Each invocation receives the
             // api's per-slot inputs exactly as declared (preserves order + duplicates).
-            val perBatchInputs = apiMatch.api.inputs.map { it.itemId to it.count.toLong() }
+            val perBatchInputs = inputs.map { it.itemId to it.count.toLong() }
             BatchProgress(batches, 0L, perBatchInputs, outputItemId, outputPerBatch, batches)
         } else {
             // Parallel: one handler invocation handles the whole demand. Scale each
             // slot's declared count by the number of batches needed to satisfy the
-            // total output, preserving slot order + duplicates.
-            val perBatchInputs = apiMatch.api.inputs.map { it.itemId to (it.count.toLong() * batches) }
+            // total output, preserving slot order + duplicates. Once the op runs in chunks,
+            // only the next chunk is scaled.
+            val chunk = cpu.opChunkProgress[op.id]
+            val batchesLeft = if (chunk != null) {
+                val left = (chunk.total - chunk.done).coerceAtLeast(1L)
+                if (chunk.fit > 0L) minOf(left, chunk.fit) else left
+            } else batches
+            val perBatchInputs = inputs.map { it.itemId to (it.count.toLong() * batchesLeft) }
             BatchProgress(
                 totalBatches = 1L,
                 batchesDone = 0L,
                 perBatchInputs = perBatchInputs,
                 outputItemId = outputItemId,
                 outputPerBatch = outputTotal,
-                batches = batches,
+                batches = batchesLeft,
             )
         }
         processBatchProgress[op.id] = progress
@@ -427,14 +899,10 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
                     return CraftScheduler.OpResult.Failed("Processing handler failed: ${op.processingApiName}")
                 }
                 // One batch done. Advance progress, if more batches remain, start the next one.
-                val progress = processBatchProgress[op.id]
-                if (progress != null) {
-                    progress.batchesDone++
-                    if (progress.batchesDone >= progress.totalBatches) {
-                        processRetries.remove(op.id)
-                        processBatchProgress.remove(op.id)
-                        return CraftScheduler.OpResult.Completed
-                    }
+                if (finishBatch(op, processBatchProgress[op.id])) {
+                    processRetries.remove(op.id)
+                    processBatchProgress.remove(op.id)
+                    return CraftScheduler.OpResult.Completed
                 }
                 // Fall through to start the next batch invocation below.
             } else {
@@ -449,7 +917,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // reload the terminal script may not have auto-started yet, so the handler isn't
         // registered. Resume doesn't need it: items are physically in machines, we just
         // poll the persisted target coords on the global ResumeScheduler (always ticking).
-        cpu.opResumeInfo[op.id]?.let { return startResumePoll(op, it, lvl, outputItemId) }
+        cpu.opResumeInfo[op.id]?.let { return startResumePoll(op, it, lvl, snapshot, outputItemId) }
 
         // FRESH PATH, needs the handler resolved. Look up by the recipe name
         // (hash) the planner picked, NOT by output itemId. When multiple
@@ -463,8 +931,9 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             ?: return CraftScheduler.OpResult.Failed("No processing API for ${op.processingApiName} / $outputItemId")
         val searchPositions = apiMatch.apiStorage.remoteTerminalPositions ?: snapshot.terminalPositions
         val handlerEngine = PlatformServices.modState
-            .findProcessingEngine(lvl, searchPositions, apiMatch.api.name, apiMatch.apiStorage.remoteDimension) as? ScriptEngine
-        val handler = handlerEngine?.processingHandlers?.get(apiMatch.api.name)
+            .findProcessingEngine(lvl, searchPositions, apiMatch.api.name, apiMatch.apiStorage.remoteDimension, apiMatch.api) as? ScriptEngine
+        val resolved = handlerEngine?.handlerFor(apiMatch.api.name, apiMatch.api)
+        val handler = resolved?.function
         if (handlerEngine == null || handler == null) {
             // No Lua handler. Before backing off, see if a Processing Handler
             // BLOCK is bound to this api on the recipe's home network. For a
@@ -480,7 +949,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             val handlerBE = blockHandlerPos?.let {
                 handlerLevel.getBlockEntity(it) as? damien.nodeworks.block.entity.ProcessingHandlerBlockEntity
             }
-            if (handlerBE != null && handlerBE.processingApiName == apiMatch.api.name) {
+            if (handlerBE != null && handlerBE.handles(apiMatch.api.name)) {
                 // [executeBlockHandler] still receives the cpu's level - it
                 // gets handed straight to [ProcessingJob] which uses it for
                 // cpu-side network re-discovery on stale-job recovery. The
@@ -491,6 +960,17 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             return scheduleHandlerWaitRetry(op, "no handler for '${apiMatch.api.name}'")
         }
         val scheduler = handlerEngine.scheduler
+
+        // An exclusive rule feeds one machine bank, so while another op has a job in it
+        // this one steps aside, the same as a Multi-Processing Handler that is not parallel.
+        val exclusiveRule = resolved.rule?.takeIf { it.exclusive }
+        if (exclusiveRule != null) {
+            val holder = HandlerReservations.holder(exclusiveRule)
+            if (holder != null && (holder.cpuPos != cpu.blockPos || holder.opId != op.id)) {
+                op.readyAt = lvl.gameTime + HANDLER_BUSY_BACKOFF_TICKS
+                return CraftScheduler.OpResult.Deferred
+            }
+        }
 
         // FRESH INVOCATION PATH
         val progress = when (val setup = resolveBatchProgress(op, apiMatch, outputItemId)) {
@@ -530,7 +1010,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // apiMatch.api.inputs provides the same ordering, we use ProcessingSet's shared
         // naming helper to keep the autocomplete editor's view in perfect sync with what
         // the runtime actually binds.
-        val paramNames = damien.nodeworks.card.ProcessingSet.buildHandlerParamNames(apiMatch.api.inputsAsPairs)
+        val paramNames = damien.nodeworks.card.ProcessingSet.buildHandlerParamNames(apiMatch.api.handlerParamSource)
         if (paramNames.size != progress.perBatchInputs.size) {
             return CraftScheduler.OpResult.Failed(
                 "Processing handler arg mismatch: ${paramNames.size} param names vs " +
@@ -538,6 +1018,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             )
         }
         val itemsTable = LuaTable()
+        val allInputs = ArrayList<LuaValue>(progress.perBatchInputs.size)
         for ((idx, slotData) in progress.perBatchInputs.withIndex()) {
             val (itemId, batchCount) = slotData
             val id = Identifier.tryParse(itemId)
@@ -548,26 +1029,35 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             // BufferSource keys on the variant's BufferKey (e.g. strength-
             // potion bucket, not the generic potion bucket). The display name
             // also picks up the variant's hover name (Potion of Strength).
-            val ingr = apiMatch.api.inputs.getOrNull(idx)
+            val ingr = effectiveInputs(op, apiMatch.api).getOrNull(idx)
             val ingrStack = ingr?.stack ?: ItemStack(item)
             val bufferKey = ingr?.bufferKey() ?: damien.nodeworks.script.BufferKey.Key(itemId, "")
-            itemsTable.set(
-                paramNames[idx],
-                ItemsHandle.toLuaTable(
-                    ItemsHandle(
-                        itemId = itemId,
-                        itemName = ingrStack.hoverName.string,
-                        count = batchCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                        maxStackSize = item.getDefaultMaxStackSize(),
-                        hasData = !bufferKey.isPlain,
-                        filter = itemId,
-                        sourceStorage = { null },
-                        level = lvl,
-                        bufferSource = BufferSource(cpu, bufferKey, batchCount)
-                    )
+            val handle = ItemsHandle.toLuaTable(
+                ItemsHandle(
+                    itemId = itemId,
+                    itemName = ingrStack.hoverName.string,
+                    count = batchCount.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    maxStackSize = item.getDefaultMaxStackSize(),
+                    hasData = !bufferKey.isPlain,
+                    filter = itemId,
+                    sourceStorage = { null },
+                    level = lvl,
+                    bufferSource = BufferSource(cpu, bufferKey, batchCount)
                 )
             )
+            itemsTable.set(paramNames[idx], handle)
+            allInputs.add(handle)
         }
+        // `items:all()` hangs off the metatable, so `pairs(items)` in an existing handler
+        // still sees only the inputs. The handles are the same ones the named fields hold.
+        itemsTable.setmetatable(LuaTable().also { meta ->
+            meta.set(LuaValue.INDEX, LuaTable().also { methods ->
+                methods.set("all", object : org.luaj.vm2.lib.OneArgFunction() {
+                    override fun call(selfArg: LuaValue): LuaValue =
+                        LuaTable().also { list -> for ((i, h) in allInputs.withIndex()) list.set(i + 1, h) }
+                })
+            })
+        })
         val luaArgs: List<LuaValue> = listOf(jobTable, itemsTable)
 
         cpu.setCrafting(true, outputItemId.substringAfter(':').replace('_', ' '))
@@ -585,7 +1075,68 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         val perBatchInputMap = progress.perBatchInputs
             .groupBy { it.first }
             .mapValues { (_, pairs) -> pairs.sumOf { it.second } }
-        return invokeHandlerAndAnalyze(op, state, perBatchInputMap, apiMatch.api.name, apiMatch.api.outputsAsPairs)
+        if (apiMatch.api.serial) {
+            val result = invokeHandlerAndAnalyze(op, state, perBatchInputMap, apiMatch.api.name, apiMatch.api.outputsAsPairs)
+            reserveWhileInFlight(exclusiveRule, op, state)
+            // Outputs already waiting finish the batch on the spot, that is one batch, not the op.
+            if (result !is CraftScheduler.OpResult.Completed) return result
+            if (!finishBatch(op, progress)) return CraftScheduler.OpResult.InProgress
+            processRetries.remove(op.id)
+            processBatchProgress.remove(op.id)
+            return result
+        }
+        val result = invokeLuaChunk(op, state, perBatchInputMap, apiMatch, progress)
+        reserveWhileInFlight(exclusiveRule, op, state)
+        return result
+    }
+
+    /** Holds [rule] for this op while its job waits on outputs. Only a job that is
+     *  really in flight reserves, one that finished at once or failed leaves the rule
+     *  free, and the reservation ends by itself when the job's pulls complete. */
+    private fun reserveWhileInFlight(rule: damien.nodeworks.script.RecipeHandlerRule?, op: Operation.Process, state: ProcessState) {
+        if (rule == null || processState[op.id] !== state || state.pending.isComplete) return
+        HandlerReservations.reserve(rule, HandlerReservations.Holder(cpu.blockPos, op.id, state.pending))
+    }
+
+    /** Parallel Lua-handler call for the next chunk of the op's batches. A handler can't be
+     *  probed, so when it moves nothing the next try halves the chunk without using up a
+     *  retry, and after a chunk that worked the next one tries double, so a machine that was
+     *  only briefly busy gets back to full size. Everything fitting in one go behaves exactly
+     *  as before. */
+    private fun invokeLuaChunk(
+        op: Operation.Process,
+        state: ProcessState,
+        declaredInputs: Map<String, Long>,
+        apiMatch: damien.nodeworks.network.ProcessingApiMatch,
+        progress: BatchProgress,
+    ): CraftScheduler.OpResult {
+        val chunk = cpu.opChunkProgress[op.id]
+            ?: damien.nodeworks.block.entity.CraftingCoreBlockEntity.ChunkProgress(progress.batches, 0L, 0L)
+        val tried = progress.batches
+        val pre = declaredInputs.mapValues { (id, _) -> cpu.getBufferCount(id) }
+        val retriesBefore = processRetries[op.id]
+        val result = invokeHandlerAndAnalyze(op, state, declaredInputs, apiMatch.api.name, apiMatch.api.outputsAsPairs)
+        val grown = if (tried > Long.MAX_VALUE / 2L) tried else tried * 2L
+        if (processState[op.id] === state) {
+            cpu.setChunkProgress(op.id, chunk.copy(inFlight = tried, fit = grown))
+            return result
+        }
+        if (result is CraftScheduler.OpResult.Completed) {
+            cpu.setChunkProgress(op.id, chunk.copy(inFlight = tried, fit = grown))
+            if (!finishBatch(op, progress)) return CraftScheduler.OpResult.InProgress
+            processRetries.remove(op.id)
+            processBatchProgress.remove(op.id)
+            return result
+        }
+        // A retry that left the buffer untouched, so a smaller chunk is safe to try.
+        val untouched = declaredInputs.keys.all { cpu.getBufferCount(it) == pre[it] }
+        if (result is CraftScheduler.OpResult.InProgress && tried > 1L && untouched) {
+            cpu.setChunkProgress(op.id, chunk.copy(fit = tried / 2L))
+            // Rebuilt on the next dispatch at the smaller size.
+            processBatchProgress.remove(op.id)
+            if (retriesBefore == null) processRetries.remove(op.id) else processRetries[op.id] = retriesBefore
+        }
+        return result
     }
 
     /**
@@ -636,13 +1187,17 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         var allConsumed = true
         var anyConsumed = false
         var stranded: String? = null
+        var unmoved: String? = null
         for ((id, required) in declaredInputs) {
             val preCount = pre[id] ?: 0L
             val now = cpu.getBufferCount(id)
             val consumed = preCount - now  // items that actually left the buffer
             when {
-                consumed == required -> anyConsumed = true
-                consumed == 0L -> allConsumed = false
+                consumed == required -> if (required > 0L) anyConsumed = true
+                consumed == 0L -> {
+                    allConsumed = false
+                    if (unmoved == null) unmoved = id
+                }
                 else -> { // partial move for this input
                     stranded = id
                     allConsumed = false
@@ -655,6 +1210,15 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             cancelInvocationPulls(state)
             return CraftScheduler.OpResult.Failed(
                 "Handler '$apiName' partially consumed input '$stranded', " +
+                "all inputs must move together (use :hasSpaceFor or restructure the handler)."
+            )
+        }
+        if (anyConsumed && !allConsumed) {
+            // Some inputs moved and others didn't. A retry can't recover, the moved ones
+            // already left the buffer.
+            cancelInvocationPulls(state)
+            return CraftScheduler.OpResult.Failed(
+                "Handler '$apiName' moved some inputs but not '$unmoved', " +
                 "all inputs must move together (use :hasSpaceFor or restructure the handler)."
             )
         }
@@ -727,27 +1291,44 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             return CraftScheduler.OpResult.InProgress
         }
 
-        // Same scaling as the Lua-handler path: full recipe outputs scaled by
-        // [progress.batches], not [progress.totalBatches].
-        val bulkOutputOverride: List<Pair<damien.nodeworks.script.RecipeIngredient, Long>>? = if (!apiMatch.api.serial) {
-            apiMatch.api.outputs.map { ingr ->
-                ingr to (ingr.count.toLong() * progress.batches)
+        // A handler that takes one job at a time and already has one, from this CPU or
+        // another, is left alone. The op gives up its thread and looks again shortly.
+        val handlerLevel = handlerBE.level as? ServerLevel
+        if (handlerBE.exclusiveUse && handlerLevel != null) {
+            val holder = HandlerReservations.holder(handlerLevel.dimension(), handlerBE.blockPos)
+            if (holder != null && (holder.cpuPos != cpu.blockPos || holder.opId != op.id)) {
+                val now = (cpu.level as? ServerLevel)?.gameTime ?: 0L
+                op.readyAt = now + HANDLER_BUSY_BACKOFF_TICKS
+                return CraftScheduler.OpResult.Deferred
             }
-        } else null
+        }
 
         cpu.setCrafting(true, outputItemId.substringAfter(':').replace('_', ' '))
 
-        val invokeResult = BlockProcessingHandler.invoke(
-            cpu = cpu,
-            level = lvl,
-            api = apiMatch.api,
-            handlerBE = handlerBE,
-            perBatchInputs = progress.perBatchInputs,
-            bulkOutputOverride = bulkOutputOverride,
-            opId = op.id,
-        )
+        // Serial runs one batch per call. Parallel runs chunks sized to what the machine takes.
+        val invokeResult = if (apiMatch.api.serial) {
+            BlockProcessingHandler.invoke(
+                cpu = cpu,
+                level = lvl,
+                api = apiMatch.api,
+                handlerBE = handlerBE,
+                perBatchInputs = progress.perBatchInputs,
+                bulkOutputOverride = null,
+                opId = op.id,
+                inputs = effectiveInputs(op, apiMatch.api),
+                channelKeys = apiMatch.api.inputs.map { handlerBE.channelKeyFor(it) },
+            )
+        } else {
+            invokeChunk(op, lvl, apiMatch, handlerBE, progress)
+        }
         return when (invokeResult) {
             is BlockProcessingHandler.InvokeResult.InProgress -> {
+                if (handlerBE.exclusiveUse && handlerLevel != null) {
+                    HandlerReservations.reserve(
+                        handlerLevel.dimension(), handlerBE.blockPos,
+                        HandlerReservations.Holder(cpu.blockPos, op.id, invokeResult.pending),
+                    )
+                }
                 val state = ProcessState(
                     pending = invokeResult.pending,
                     processingJob = invokeResult.job,
@@ -761,8 +1342,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
             is BlockProcessingHandler.InvokeResult.CompletedSync -> {
                 if (invokeResult.pending.success) {
                     // One batch done. Match the Lua path's batch advancement.
-                    progress.batchesDone++
-                    if (progress.batchesDone >= progress.totalBatches) {
+                    if (finishBatch(op, progress)) {
                         processRetries.remove(op.id)
                         processBatchProgress.remove(op.id)
                         CraftScheduler.OpResult.Completed
@@ -789,6 +1369,69 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
     }
 
 
+    /** Parallel block-handler call for as many of the op's remaining batches as the machine
+     *  takes right now, so a request bigger than the machine's slots runs in chunks instead
+     *  of retrying until it fails. The chunk is sized by a simulate-only probe and the handler
+     *  is called once, exactly as before when everything fits. When not even one batch fits
+     *  nothing is moved and it counts as a retry. */
+    private fun invokeChunk(
+        op: Operation.Process,
+        lvl: ServerLevel,
+        apiMatch: damien.nodeworks.network.ProcessingApiMatch,
+        handlerBE: damien.nodeworks.block.entity.ProcessingHandlerBlockEntity,
+        progress: BatchProgress,
+    ): BlockProcessingHandler.InvokeResult {
+        val chunk = cpu.opChunkProgress[op.id]
+            ?: damien.nodeworks.block.entity.CraftingCoreBlockEntity.ChunkProgress(progress.batches, 0L, 0L)
+        val left = (chunk.total - chunk.done).coerceAtLeast(1L)
+        val remaining = if (chunk.fit > 0L) minOf(left, chunk.fit) else left
+        val inputs = effectiveInputs(op, apiMatch.api)
+        val channelKeys = apiMatch.api.inputs.map { handlerBE.channelKeyFor(it) }
+        val batches = BlockProcessingHandler.fittingBatches(apiMatch.api, handlerBE, remaining, inputs, channelKeys)
+        if (batches <= 0L) {
+            return BlockProcessingHandler.InvokeResult.Retry("the machine has no room for even one batch of '${apiMatch.api.name}'")
+        }
+        val result = BlockProcessingHandler.invoke(
+            cpu = cpu,
+            level = lvl,
+            api = apiMatch.api,
+            handlerBE = handlerBE,
+            perBatchInputs = inputs.map { it.itemId to it.count.toLong() * batches },
+            bulkOutputOverride = apiMatch.api.outputs.map { it to it.count.toLong() * batches },
+            opId = op.id,
+            inputs = inputs,
+            channelKeys = channelKeys,
+        )
+        if (result is BlockProcessingHandler.InvokeResult.InProgress || result is BlockProcessingHandler.InvokeResult.CompletedSync) {
+            cpu.setChunkProgress(op.id, chunk.copy(inFlight = batches))
+        } else if (result is BlockProcessingHandler.InvokeResult.Retry && batches > 1L) {
+            // The probe read high, e.g. two inputs sharing one inventory. Cap the next try lower.
+            cpu.setChunkProgress(op.id, chunk.copy(fit = batches / 2L))
+        }
+        return result
+    }
+
+    /** Count a handler call that just finished, true when the op is done. A chunked op adds
+     *  its in-flight chunk and is done once every batch has run, otherwise its progress is
+     *  dropped so the next dispatch rebuilds it and sends the next chunk. */
+    private fun finishBatch(op: Operation.Process, progress: BatchProgress?): Boolean {
+        val chunk = cpu.opChunkProgress[op.id]
+        if (chunk != null && chunk.inFlight > 0L) {
+            val done = chunk.done + chunk.inFlight
+            if (done >= chunk.total) {
+                cpu.clearChunkProgress(op.id)
+                return true
+            }
+            cpu.setChunkProgress(op.id, chunk.copy(done = done, inFlight = 0L))
+            processBatchProgress.remove(op.id)
+            processRetries.remove(op.id)
+            return false
+        }
+        if (progress == null) return false
+        progress.batchesDone++
+        return progress.batchesDone >= progress.totalBatches
+    }
+
     /**
      * Resume an in-flight Process op after world reload. The handler's items survived the
      * reload as physical machine contents (e.g. raw iron in a furnace), so we don't re-invoke
@@ -798,10 +1441,28 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
      * Polls run on the global [damien.nodeworks.script.ResumeScheduler.scheduler], independent
      * of any terminal/script engine, the terminal's auto-run can lag CPU ticking on world load.
      */
+    /** The handler block bound to [op]'s recipe when it takes one job at a time, with
+     *  its level. Resolved the way the fresh path resolves it, through a remote
+     *  provider network when the recipe came in over an antenna. */
+    private fun exclusiveHandlerFor(
+        op: Operation.Process,
+        lvl: ServerLevel,
+        snapshot: damien.nodeworks.network.NetworkSnapshot,
+    ): Pair<ServerLevel, damien.nodeworks.block.entity.ProcessingHandlerBlockEntity>? {
+        val apiMatch = snapshot.findProcessingApiByName(op.processingApiName)
+        val handlerNetworkId = apiMatch?.apiStorage?.remoteNetworkId ?: snapshot.networkId
+        val handlerLevel = apiMatch?.apiStorage?.remoteDimension?.let { lvl.server.getLevel(it) } ?: lvl
+        val pos = BlockHandlerRegistry.find(handlerNetworkId, op.processingApiName) ?: return null
+        val handler = handlerLevel.getBlockEntity(pos) as? damien.nodeworks.block.entity.ProcessingHandlerBlockEntity ?: return null
+        if (!handler.exclusiveUse) return null
+        return handlerLevel to handler
+    }
+
     private fun startResumePoll(
         op: Operation.Process,
         info: damien.nodeworks.block.entity.CraftingCoreBlockEntity.OpResumeInfo,
         lvl: ServerLevel,
+        snapshot: damien.nodeworks.network.NetworkSnapshot,
         outputItemId: String
     ): CraftScheduler.OpResult {
         // BatchProgress as a single-batch, no-input bulk op (items already in machine).
@@ -822,22 +1483,38 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         }
         val scheduler = damien.nodeworks.script.ResumeScheduler.scheduler
         val pending = CraftingHelper.PendingHandlerJob()
+        // The machine still holds this op's items, so its handler stays this op's until
+        // they are out, the same as it would have been had the world not reloaded.
+        exclusiveHandlerFor(op, lvl, snapshot)?.let { (handlerLevel, handler) ->
+            HandlerReservations.reserve(
+                handlerLevel.dimension(), handler.blockPos,
+                HandlerReservations.Holder(cpu.blockPos, op.id, pending),
+            )
+        }
+        // Each entry is the per-operation count with the remainder alongside, the shape the
+        // job's bulk override takes, so a bonus copy of the main output is still told apart.
+        val resumeOutputs = buildList {
+            for ((i, out) in info.outputs.withIndex()) {
+                val (template, count) = out
+                if (template.isEmpty) continue
+                val perOp = info.outputsPerOp.getOrNull(i) ?: count.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+                add(damien.nodeworks.script.RecipeIngredient(template.copyWithCount(1), perOp) to count)
+            }
+            for (out in info.optionals) {
+                if (out.template.isEmpty) continue
+                add(damien.nodeworks.script.RecipeIngredient(out.template.copyWithCount(1), out.perOp, optional = true) to out.remaining)
+            }
+        }
         val syntheticApi = damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo(
             name = info.processingApiName,
             inputs = emptyList(),
             // Persisted template stacks carry variant components, so the
             // poll matches the exact output variant.
-            outputs = info.outputs.mapNotNull { (template, count) ->
-                if (template.isEmpty) return@mapNotNull null
-                damien.nodeworks.script.RecipeIngredient(
-                    template.copyWithCount(1),
-                    count.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                )
-            },
+            outputs = resumeOutputs.map { it.first },
             timeout = 6000,
             serial = false
         )
-        val resumeJob = ProcessingJob(syntheticApi, cpu, lvl, scheduler, pending, null, op.id)
+        val resumeJob = ProcessingJob(syntheticApi, cpu, lvl, scheduler, pending, resumeOutputs, op.id)
         val getters = info.pullTargets.map { (pos, face) ->
             damien.nodeworks.script.CardHandle.StorageGetter {
                 PlatformServices.storage.getItemStorage(lvl, pos, face)
@@ -850,6 +1527,10 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // we ticked), don't bother stashing state, collapse straight to Completed/Failed.
         if (pending.isComplete) {
             return if (pending.success) {
+                // A chunked op still has chunks to run after the one that was in flight.
+                if (cpu.opChunkProgress[op.id] != null) {
+                    if (!finishBatch(op, processBatchProgress[op.id])) return CraftScheduler.OpResult.InProgress
+                }
                 processBatchProgress[op.id]?.let { it.batchesDone = it.totalBatches }
                 CraftScheduler.OpResult.Completed
             } else {
@@ -922,6 +1603,7 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // Drop the registered state so the next dispatch re-invokes the
         // handler fresh instead of polling a never-completing pending.
         if (state != null) processState.remove(op.id)
+        HandlerReservations.release(cpu.blockPos, op.id)
         // Per-op resume info is only meaningful when items actually reached
         // the machine; on a failed-move retry we're starting fresh.
         cpu.clearOpResume(op.id)
@@ -937,7 +1619,12 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
     // Lifecycle
     // =====================================================================
 
+    override fun onPlanStarted(plan: CraftPlan) {
+        cpu.clearOpState()
+    }
+
     override fun onPlanCompleted(plan: CraftPlan) {
+        HandlerReservations.releaseAll(cpu.blockPos)
         // Defensive: should be empty by now (each op cleans on completion), but a stuck
         // entry would leak across plans since op IDs reset to 0 each plan.
         val planOpIds = plan.ops.map { it.id }.toSet()
@@ -949,29 +1636,36 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         // they stop trying to pour items into this (now-idle) CPU's buffer. Their next
         // tryExtract will see stale jobGeneration and route pulled items to network storage.
         cpu.invalidateInFlightPolls()
-        // For omit-deliver plans (network:craft), the produced items are SUPPOSED to
-        // still be in the buffer at this point so the script's `:connect(fn)` callback
-        // can claim them via a buffer-backed handle. Skipping the flush here is what
-        // makes that contract work, the completion listener (run below) takes
-        // ownership of the buffer instead.
-        if (!plan.omitDeliver) {
+        // Omit-deliver plans skip the flush: the completion listener owns the
+        // buffer so the script's `:connect(fn)` can claim it. No listener means
+        // the plan resumed from NBT and nobody will ever claim it, so flush and
+        // release like a normal plan instead of stranding items and the CPU.
+        val listener = completionListeners.remove(plan)
+        progressListeners.remove(plan)
+        if (trickleResolvedFor === plan) {
+            trickle = null
+            trickleResolvedFor = null
+        }
+        if (planCacheFor === plan) {
+            planCache = null
+            planCacheFor = null
+        }
+        if (!plan.omitDeliver || listener == null) {
             flushBufferToStorage()
         }
         // A successful craft clears any lingering failure message from a previous failed run.
         if (cpu.lastFailureReason.isNotEmpty()) cpu.lastFailureReason = ""
-        // omit-deliver: don't clear craft state yet, the runtime's `dropRemainingBuffer`
-        // does it after the user's callback runs. Clearing here would also wipe
-        // `originalCraftId` and `craftTreeSnapshot` which the script-side completion
-        // path doesn't currently rely on, but keeping them consistent across the two
-        // exit paths means future code can treat "in-buffer items" as "craft still alive".
-        if (!plan.omitDeliver) {
+        // omit-deliver with a live listener: don't clear craft state yet, the runtime's
+        // `dropRemainingBuffer` does it after the user's callback runs.
+        if (!plan.omitDeliver || listener == null) {
             cpu.clearAllCraftState()
             cpu.setCrafting(false)
         }
-        completionListeners.remove(plan)?.invoke(true)
+        listener?.invoke(true)
     }
 
     override fun onPlanFailed(plan: CraftPlan, reason: String) {
+        HandlerReservations.releaseAll(cpu.blockPos)
         logger.warn("CPU at {}: plan for {} failed: {}", cpu.blockPos, plan.rootItemId, reason)
         val planOpIds = plan.ops.map { it.id }.toSet()
         processState.keys.retainAll { it !in planOpIds }
@@ -1002,6 +1696,15 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
         }
         cpu.clearAllCraftState()
         cpu.setCrafting(false)
+        progressListeners.remove(plan)
+        if (trickleResolvedFor === plan) {
+            trickle = null
+            trickleResolvedFor = null
+        }
+        if (planCacheFor === plan) {
+            planCache = null
+            planCacheFor = null
+        }
         completionListeners.remove(plan)?.invoke(false)
     }
 
@@ -1109,6 +1812,20 @@ class CpuOpExecutor(private val cpu: CraftingCoreBlockEntity) : CraftScheduler.O
     }
 
     companion object {
+        /** Ticks between trickle moves when nothing forces one sooner. */
+        const val TRICKLE_INTERVAL = 20L
+        /** Fewest ticks between moves when full stacks keep arriving, so a fast bank of
+         *  machines is served in batches rather than every tick. */
+        const val TRICKLE_MIN_GAP = 4L
+        /** Ticks between walks forced past a home that sits below the top priority, so a
+         *  higher card that has freed up takes over within this long. */
+        const val TRICKLE_PRIORITY_RECHECK = 100L
+        /** Longest wait between attempts while storage keeps refusing the root item. */
+        const val TRICKLE_MAX_BACKOFF = 200L
+        /** Stacks one trickle move may insert before yielding to the next interval. */
+        const val TRICKLE_MAX_STACKS = 64
+        /** Wall-clock budget for one trickle move once something has landed. */
+        const val TRICKLE_BUDGET_NANOS = 250_000L
         /** Fallback throttle when the CPU isn't formed (no buffer). High enough that
          *  [CpuRules.opCost] rounds to 0, crafts chain instantly through the scheduler. */
         const val DEFAULT_THROTTLE: Float = 10.0f

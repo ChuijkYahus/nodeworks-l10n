@@ -71,6 +71,17 @@ class BufferState {
         typesCapacity = typesCap.coerceAtLeast(0)
     }
 
+    /** Insert past the capacity limits. For outputs a running craft has already pulled
+     *  and has nowhere else to put: the buffer may run over for a while rather than
+     *  push them back into a machine or drop them. */
+    fun insertForced(stack: ItemStack, amount: Long) {
+        if (amount <= 0) return
+        val key = BufferKey.of(stack)
+        val existing = items[key]
+        items[key] = if (existing == null) Entry(stack.copyWithCount(1), amount)
+            else existing.copy(count = existing.count + amount)
+    }
+
     // =====================================================================
     // Query
     // =====================================================================
@@ -140,6 +151,20 @@ class BufferState {
         return true
     }
 
+    /** Insert a crafting result into [itemId]'s plain bucket with [template] as its
+     *  template. Crafting ops address outputs by item id, the template keeps what the
+     *  recipe produced. */
+    fun insertCrafted(itemId: String, template: ItemStack, amount: Long): Boolean {
+        if (amount <= 0) return true
+        val key = BufferKey.Key(itemId, "")
+        if (!canAccept(key, amount)) return false
+        val existing = items[key]
+        // An existing bucket keeps its template.
+        items[key] = if (existing == null) Entry(template.copyWithCount(1), amount)
+            else existing.copy(count = existing.count + amount)
+        return true
+    }
+
     /** Backward-compat itemId-only insertion. Builds a plain (empty-components)
      *  template stack so the bucket is keyed under empty-hash. */
     fun insert(itemId: String, amount: Long): Boolean {
@@ -190,9 +215,12 @@ class BufferState {
     fun saveToNBT(tag: CompoundTag, registryAccess: net.minecraft.core.HolderLookup.Provider) {
         val ops = RegistryOps.create(NbtOps.INSTANCE, registryAccess)
         val entriesTag = net.minecraft.nbt.ListTag()
-        for ((_, entry) in items) {
+        for ((key, entry) in items) {
             if (entry.count <= 0) continue
             val entryTag = CompoundTag()
+            // A crafted output's plain bucket has a template with components, so its key
+            // can't be derived from the template on load.
+            entryTag.putString("hash", key.componentsHash)
             // Save the components-bearing template stack with count = 1; the
             // authoritative count lives next to it as a Long so worlds with
             // > Int.MAX_VALUE buffered items still serialize correctly.
@@ -224,7 +252,13 @@ class BufferState {
                 if (stack.isEmpty) continue
                 val cnt = entryTag.getLong("count").orElse(0L)
                 if (cnt <= 0L) continue
-                items[BufferKey.of(stack)] = Entry(stack.copyWithCount(1), cnt)
+                val derived = BufferKey.of(stack)
+                // The key is this session's hash of the template, never the saved one, which
+                // an older build may have written differently. The one exception is a crafted
+                // output in its item's plain bucket, which the saved empty hash marks.
+                val hash = entryTag.getString("hash").orElse(null)
+                val key = if (hash != null && hash.isEmpty()) BufferKey.Key(derived.itemId, "") else derived
+                items[key] = Entry(stack.copyWithCount(1), cnt)
             }
         } else {
             // Legacy migration: itemId → count, no components. Each entry lands

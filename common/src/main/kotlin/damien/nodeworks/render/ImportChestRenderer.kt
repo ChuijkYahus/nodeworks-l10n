@@ -1,5 +1,6 @@
 package damien.nodeworks.render
 
+import damien.nodeworks.network.NetworkSettingsRegistry
 import com.mojang.blaze3d.vertex.PoseStack
 import com.mojang.blaze3d.vertex.VertexConsumer
 import com.mojang.math.Axis
@@ -138,6 +139,11 @@ open class ImportChestRenderer(context: BlockEntityRendererProvider.Context) :
         state.openness = blockEntity.getOpenNess(partialTicks)
         state.facing = blockEntity.blockState.getValue(ImportChestBlock.FACING)
         state.networkColor = resolveNetworkColor(blockEntity)
+        // Wireless only: no network, but a receiver above feeding it. Lit in the same
+        // white a controller-less network uses, so it reads as working rather than idle.
+        if (state.networkColor == NodeConnectionRenderer.DEFAULT_NETWORK_COLOR && blockEntity.hasReceiverAntenna()) {
+            state.networkColor = NetworkSettingsRegistry.ANCHORED_NETWORK_COLOR
+        }
     }
 
     override fun submitConnectable(

@@ -20,6 +20,9 @@ import org.luaj.vm2.lib.jse.JseMathLib
  *  [network:count] / [network:find] as the right alternative for aggregate work. */
 private const val MAX_FINDEACH_RESULTS = 10_000
 
+/** How long one observer `data()` read of a block stays good for, in ticks. */
+private const val DATA_CACHE_TICKS = 20L
+
 /**
  * Manages a sandboxed Lua VM for one terminal. Provides the Nodeworks API
  * (card, scheduler, print) and gates each Lua entry point with a wall-clock
@@ -144,6 +147,99 @@ class ScriptEngine(
         presets.add(p)
     }
 
+    /** The builder `network:recipes(...)` returns. Holds rules until `:handle` copies
+     *  them into a [RecipeHandlerRule], so a builder reused afterwards changes nothing
+     *  already registered. */
+    private fun recipeMatcherTable(allow: List<String>): LuaTable {
+        val inputs = damien.nodeworks.script.preset.RuleSet().apply { setAllow(allow) }
+        val outputs = ArrayList<String>()
+        // One handler for many recipes usually means one machine bank, and two crafts
+        // in one bank stall each other, so one craft at a time unless asked otherwise.
+        var exclusive = true
+        val t = LuaTable()
+        t.set("except", object : VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs {
+                inputs.except(damien.nodeworks.script.preset.RuleSet.rulesFromArgs(args, 2))
+                return t
+            }
+        })
+        t.set("outputs", object : VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs {
+                val rules = damien.nodeworks.script.preset.RuleSet.rulesFromArgs(args, 2)
+                if (rules.isEmpty()) outputs.clear() else outputs.addAll(rules)
+                return t
+            }
+        })
+        t.set("parallel", object : VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs {
+                exclusive = !(args.arg(2).isnil() || args.arg(2).toboolean())
+                return t
+            }
+        })
+        t.set("handle", object : VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs {
+                val fn = args.checkfunction(2)
+                assertCallbackCap(recipeRules.size, "recipe-handler")
+                val label = buildString {
+                    append("recipes(").append(inputs.allow.joinToString(", ").ifEmpty { "*" }).append(")")
+                    if (inputs.deny.isNotEmpty()) append(" except(").append(inputs.deny.joinToString(", ")).append(")")
+                    if (outputs.isNotEmpty()) append(" outputs(").append(outputs.joinToString(", ")).append(")")
+                    if (!exclusive) append(" parallel")
+                }
+                val rule = RecipeHandlerRule(
+                    inputs = damien.nodeworks.script.preset.RuleSet().apply {
+                        setAllow(inputs.allow.toList())
+                        except(inputs.deny.toList())
+                    },
+                    outputs = if (outputs.isEmpty()) null
+                        else damien.nodeworks.script.preset.RuleSet().apply { setAllow(outputs.toList()) },
+                    handler = fn,
+                    exclusive = exclusive,
+                    label = label,
+                )
+                recipeRules.add(rule)
+                return recipeHandlerTable(rule)
+            }
+        })
+        return t
+    }
+
+    /** What `:handle` returns, to stop the rule or see what it takes right now. */
+    private fun recipeHandlerTable(rule: RecipeHandlerRule): LuaTable {
+        val t = LuaTable()
+        t.set("stop", object : OneArgFunction() {
+            override fun call(selfArg: LuaValue): LuaValue {
+                rule.active = false
+                recipeRules.remove(rule)
+                return LuaValue.NIL
+            }
+        })
+        t.set("sets", object : OneArgFunction() {
+            override fun call(selfArg: LuaValue): LuaValue {
+                val out = LuaTable()
+                if (!rule.active) return out
+                val snapshot = networkSnapshot ?: return out
+                var i = 1
+                for (storage in snapshot.processingApis) {
+                    // A set pulled in over an antenna is handled on the network it came from.
+                    if (storage.remoteTerminalPositions != null) continue
+                    for (api in storage.apis) {
+                        if (i > MAX_LISTED_SETS) return out
+                        if (handlerFor(api.name, api)?.rule !== rule) continue
+                        out.set(i++, LuaValue.valueOf(describeSet(api)))
+                    }
+                }
+                return out
+            }
+        })
+        return t
+    }
+
+    /** `minecraft:raw_iron -> minecraft:iron_ingot`, for `:sets()`. */
+    private fun describeSet(api: damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo): String =
+        api.inputs.joinToString(", ") { if (it.count > 1) "${it.count}x ${it.itemId}" else it.itemId } + " -> " +
+            api.outputs.filterNot { it.optional }.joinToString(", ") { if (it.count > 1) "${it.count}x ${it.itemId}" else it.itemId }
+
     /** Current network snapshot. Rebuilt by [start] and refreshed periodically.
      *  Presets compare identity (`!==`) to decide when to re-resolve card names. */
     internal fun currentSnapshot(): NetworkSnapshot? = networkSnapshot
@@ -161,6 +257,18 @@ class ScriptEngine(
     /** Log an error through the terminal's log callback. Presets use this when
      *  a tick throws so the player sees the error without the preset unscheduling. */
     internal fun logError(msg: String) = logCallback(msg, true)
+
+    private val lastReportTick = HashMap<String, Long>()
+
+    /** Terminal error for a move that failed without throwing. At most one per [key] per
+     *  second, so a script retrying every tick doesn't bury its own output. */
+    internal fun reportMoveFailure(key: String, msg: String) {
+        val tick = PlatformServices.modState.tickCount
+        val last = lastReportTick[key]
+        if (last != null && tick - last < 20L && tick >= last) return
+        lastReportTick[key] = tick
+        logCallback(msg, true)
+    }
 
     /** Whether a card with the given physical identity still exists in the
      *  current network. Same identity rule as [CardHandle.verifyCardOnNetwork]
@@ -191,6 +299,27 @@ class ScriptEngine(
 
     /** Processing handlers registered by network:handle(). Keyed by card name. */
     val processingHandlers = mutableMapOf<String, LuaFunction>()
+
+    /** `network:recipes(...):handle(fn)` rules, in registration order. */
+    internal val recipeRules = mutableListOf<RecipeHandlerRule>()
+
+    /** What runs a Processing Set on this engine, and the rule it came from if any. */
+    class ResolvedHandler(val function: LuaFunction, val rule: RecipeHandlerRule?)
+
+    /** What runs [apiName] here: its exact `network:handle`, else the first rule that
+     *  matches [api]. A rule steps aside for a set a Processing Handler block is bound
+     *  to, so a broad rule never takes a set the player ticked on a block. With no
+     *  [api] only exact handlers count, which is what claim checks ask about. */
+    fun handlerFor(apiName: String, api: damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo?): ResolvedHandler? {
+        processingHandlers[apiName]?.let { return ResolvedHandler(it, null) }
+        if (api == null || recipeRules.isEmpty()) return null
+        if (damien.nodeworks.script.cpu.BlockHandlerRegistry.find(networkSnapshot?.networkId, apiName) != null) return null
+        val registries = level.registryAccess()
+        for (rule in recipeRules) {
+            if (rule.active && rule.matches(api, registries)) return ResolvedHandler(rule.handler, rule)
+        }
+        return null
+    }
 
     /** Redstone onChange callbacks. Keyed by card alias → (capability, lastStrength, callback).
      *  [slotIndex] pins the registration to a specific physical card slot so removing the
@@ -348,8 +477,13 @@ class ScriptEngine(
         routeTable = null
         inventoryCache = null // clear local reference, cache lives in global registry
         processingHandlers.clear()
+        // Inactive first, a CPU still holding a rule then sees it gone.
+        for (rule in recipeRules) rule.active = false
+        recipeRules.clear()
         redstoneCallbacks.clear()
         observerCallbacks.clear()
+        blockDataCache.clear()
+        energyCache.clear()
         // Stop every registered preset before wiping the scheduler so per-preset
         // cleanup (Stocker's pending craft callbacks, cached CardSnapshot lookups,
         // etc.) runs while the scheduler task ids are still valid. Exceptions in
@@ -462,6 +596,7 @@ class ScriptEngine(
     /** Whether this engine should stay alive, has scheduler tasks, handlers, or routing. */
     fun hasWork(): Boolean = scheduler.hasActiveTasks()
         || processingHandlers.isNotEmpty()
+        || recipeRules.isNotEmpty()
         || redstoneCallbacks.isNotEmpty()
         || observerCallbacks.isNotEmpty()
         || routeTable?.hasRoutes() == true
@@ -485,8 +620,14 @@ class ScriptEngine(
         // side. If our entry node no longer claims a network the terminal is effectively
         // disconnected, running further would silently operate against a stale snapshot
         // so stop with a clear error and let auto-run restart us once reconnected.
+        // A Node-anchored network keeps an id with no controller, so the id alone no
+        // longer proves one is reachable. The walk is cached per tick, asked once a
+        // second so a pulled controller stops the script within that second.
         val entry = level.getBlockEntity(networkEntryNode) as? damien.nodeworks.network.Connectable
-        if (entry?.networkId == null) {
+        val controllerGone = entry?.networkId == null ||
+            ((tickCount + (networkEntryNode.hashCode().toLong() and 0x7FFFFFFFL)) % 20L == 0L &&
+                !NetworkDiscovery.discoverNetwork(level, networkEntryNode).hasController)
+        if (controllerGone) {
             logCallback("Network disconnected, no controller reachable.", true)
             stop()
             return
@@ -592,6 +733,61 @@ class ScriptEngine(
      *  surface as Lua numbers, booleans as booleans, and enum-like properties (facing,
      *  half, axis, …) as lowercase strings to match Minecraft's command syntax. Block
      *  types with no properties produce an empty table. */
+    /** One observer's saved-data read: when it was taken, which block entity it came from,
+     *  and the data. A different entity at the same position means the block was replaced,
+     *  so the entry is stale whatever its age. */
+    private class BlockDataEntry(
+        val tick: Long,
+        val entity: net.minecraft.world.level.block.entity.BlockEntity?,
+        val tag: net.minecraft.nbt.CompoundTag?,
+    )
+
+    /** Saved data of the block entity at [pos]. Serializing a block entity is the costly
+     *  part, so each position is saved at most once a second for this script, however
+     *  often it asks. A fresh table is built each call, so a script can't change what the
+     *  next read sees. */
+    private val blockDataCache = HashMap<net.minecraft.core.BlockPos, BlockDataEntry>()
+
+    private fun blockEntityData(pos: net.minecraft.core.BlockPos): LuaValue {
+        // Checked before the cache so an admin's /reload applies at once, not after the
+        // cached read expires.
+        val state = level.getBlockState(pos)
+        if (ObserverDenyList.isDenied(state)) {
+            throw LuaError("Reading ${blockIdOf(state)} with :data() is disabled on this server.")
+        }
+        val tick = PlatformServices.modState.tickCount
+        val entity = level.getBlockEntity(pos)
+        val cached = blockDataCache[pos]
+        val tag = if (cached != null && cached.entity === entity && tick - cached.tick < DATA_CACHE_TICKS) {
+            cached.tag
+        } else {
+            val fresh = try {
+                entity?.saveCustomOnly(level.registryAccess())
+            } catch (e: Exception) {
+                org.slf4j.LoggerFactory.getLogger("nodeworks-observer")
+                    .warn("Block entity at {} threw while saving its data for an observer", pos, e)
+                null
+            }
+            if (blockDataCache.size >= 64) blockDataCache.clear()
+            blockDataCache[pos] = BlockDataEntry(tick, entity, fresh)
+            fresh
+        }
+        return if (tag == null) LuaValue.NIL else damien.nodeworks.script.NbtToLua.convert(tag)
+    }
+
+    /** Energy is cheap to read and should be current, so it is only shared within a tick. */
+    private val energyCache = HashMap<net.minecraft.core.BlockPos, Pair<Long, damien.nodeworks.platform.EnergyInfo?>>()
+
+    private fun blockEnergy(pos: net.minecraft.core.BlockPos, face: net.minecraft.core.Direction): damien.nodeworks.platform.EnergyInfo? {
+        val tick = PlatformServices.modState.tickCount
+        val cached = energyCache[pos]
+        if (cached != null && cached.first == tick) return cached.second
+        val fresh = PlatformServices.storage.getEnergy(level, pos, face)
+        if (energyCache.size >= 64) energyCache.clear()
+        energyCache[pos] = tick to fresh
+        return fresh
+    }
+
     private fun blockStateToLua(state: net.minecraft.world.level.block.state.BlockState): LuaTable {
         val t = LuaTable()
         for (prop in state.properties) {
@@ -609,6 +805,9 @@ class ScriptEngine(
     }
 
     companion object {
+        /** Most entries `:sets()` returns, a bound on one call's work and table size. */
+        private const val MAX_LISTED_SETS = 512
+
         /**
          * Strips Luau-style type annotations from script text before Lua compilation.
          * Handles: function params `(x: Type)`, return types `): Type`, local vars `local x: Type =`
@@ -780,6 +979,7 @@ class ScriptEngine(
             level,
             currentSnapshot()?.controller?.networkId,
             ::currentNetworkSnapshot,
+            ::reportMoveFailure,
         )
         // Per-tick call cap is enforced inside [CardHandle.buildInsertFn] so all
         // insert paths share the budget uniformly, including handles returned from
@@ -892,6 +1092,26 @@ class ScriptEngine(
                 override fun call(selfArg: LuaValue): LuaValue {
                     verifyCardPresent()
                     return blockStateToLua(level.getBlockState(cap.adjacentPos))
+                }
+            })
+
+            // data() → table, the watched block entity's saved data, nil for a plain block.
+            table.setGuarded("ObserverCard", "data", object : OneArgFunction() {
+                override fun call(selfArg: LuaValue): LuaValue {
+                    verifyCardPresent()
+                    return blockEntityData(cap.adjacentPos)
+                }
+            })
+
+            // energy() → { stored, capacity }, nil when the block stores no energy.
+            table.setGuarded("ObserverCard", "energy", object : OneArgFunction() {
+                override fun call(selfArg: LuaValue): LuaValue {
+                    verifyCardPresent()
+                    val info = blockEnergy(cap.adjacentPos, cap.accessFace) ?: return LuaValue.NIL
+                    val t = LuaTable()
+                    t.set("stored", LuaValue.valueOf(info.stored.toDouble()))
+                    t.set("capacity", LuaValue.valueOf(info.capacity.toDouble()))
+                    return t
                 }
             })
 
@@ -1080,7 +1300,7 @@ class ScriptEngine(
                                     } else null
                                 }
                         }
-                        return ItemsHandle.toLuaTable(ItemsHandle.fromItemInfo(aggregated, filter, sourceStorage, level))
+                        return ItemsHandle.toLuaTable(ItemsHandle.fromItemInfo(aggregated, filter, sourceStorage, level, ItemsHandle.Origin.Pool(color)))
                     }
                 }
                 if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.FLUID) {
@@ -1100,7 +1320,7 @@ class ScriptEngine(
                                     } else null
                                 }
                         }
-                        return ItemsHandle.toLuaTable(ItemsHandle.fromFluidInfo(aggregated, filter, fluidSource, level))
+                        return ItemsHandle.toLuaTable(ItemsHandle.fromFluidInfo(aggregated, filter, fluidSource, level, ItemsHandle.Origin.Pool(color)))
                     }
                 }
                 return LuaValue.NIL
@@ -1133,7 +1353,7 @@ class ScriptEngine(
                                     } else null
                                 }
                         }
-                        val handle = ItemsHandle.fromItemInfo(info, info.itemId, sourceStorage, level)
+                        val handle = ItemsHandle.fromItemInfo(info, info.itemId, sourceStorage, level, ItemsHandle.Origin.Pool(color))
                         result.set(idx++, ItemsHandle.toLuaTable(handle))
                     }
                 }
@@ -1157,7 +1377,7 @@ class ScriptEngine(
                                     } else null
                                 }
                         }
-                        val handle = ItemsHandle.fromFluidInfo(info, "\$fluid:${info.fluidId}", fluidSource, level)
+                        val handle = ItemsHandle.fromFluidInfo(info, "\$fluid:${info.fluidId}", fluidSource, level, ItemsHandle.Origin.Pool(color))
                         result.set(idx++, ItemsHandle.toLuaTable(handle))
                     }
                 }
@@ -1299,6 +1519,11 @@ class ScriptEngine(
                     throw LuaError("Expected an ItemsHandle from :find() or network:craft()")
                 }
                 val itemsHandle = ref.handle
+                val origin = itemsHandle.origin
+                if (origin is ItemsHandle.Origin.Pool && channel.overlaps(origin.channel)) {
+                    val op = if (atomic) "insert" else "tryInsert"
+                    throw LuaError(" can't move network items back into the same network storage")
+                }
                 val requested = minOf(maxCount, itemsHandle.count.toLong())
                 if (requested <= 0L) {
                     return if (atomic) LuaValue.FALSE else LuaValue.valueOf(0)
@@ -1422,31 +1647,51 @@ class ScriptEngine(
         // shortfalls don't burn budget on items that didn't actually move).
         val tick = PlatformServices.modState.tickCount
         val budget = NetworkRateLimits.forNetwork(snapshot.controller?.networkId)
+        moveGate(budget, tick, requested, atomic)?.let { return it }
         val available = budget.availableItems(tick)
         if (available < requested) {
-            if (budget.warnOnce(NetworkBudget.WARN_ITEMS_MOVED)) {
-                logCallback("[items moved rate-limited this tick on this network]", true)
+            if (atomic) {
+                reportMoveFailure("network:insert:limit", NetworkBudget.itemLimitMessage("network:insert", requested, available))
+                return LuaValue.FALSE
             }
-            if (atomic) return LuaValue.FALSE
             if (available <= 0L) return LuaValue.valueOf(0)
         }
         val clamped = minOf(requested, available)
 
         return if (atomic) {
-            val ok = NetworkStorageHelper.tryInsertItemsAcrossNetwork(
-                level, snapshot, sourceStorage, itemsHandle.filter,
-                clamped, routeTable, inventoryCache, channel
-            )
+            val ok = budget.timedMove(tick, atomic = true) {
+                NetworkStorageHelper.tryInsertItemsAcrossNetwork(
+                    level, snapshot, sourceStorage, itemsHandle.filter,
+                    clamped, routeTable, inventoryCache, channel,
+                    onFail = { reason, msg -> reportMoveFailure("network:insert:$reason", msg) },
+                )
+            }
             if (ok) budget.noteItemsMoved(tick, clamped)
             LuaValue.valueOf(ok)
         } else {
-            val moved = NetworkStorageHelper.insertItems(
-                level, snapshot, sourceStorage, itemsHandle.filter,
-                clamped, routeTable, null, inventoryCache, channel
-            )
+            val moved = budget.timedMove(tick, atomic = false) {
+                NetworkStorageHelper.insertItems(
+                    level, snapshot, sourceStorage, itemsHandle.filter,
+                    clamped, routeTable, null, inventoryCache, channel
+                )
+            }
             budget.noteItemsMoved(tick, moved)
             LuaValue.valueOf(moved.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
         }
+    }
+
+    /** The 16k ceiling for atomic inserts and the per-tick move time, shared by the network
+     *  insert paths. Returns the result to hand back when the move must not run, null to go
+     *  ahead. tryInsert stops quietly once time is spent, insert says why. */
+    private fun moveGate(budget: NetworkBudget, tick: Long, requested: Long, atomic: Boolean): LuaValue? {
+        if (atomic && requested > NetworkBudget.MAX_ATOMIC_ITEMS) {
+            reportMoveFailure("network:insert:ceiling", NetworkBudget.atomicCeilingMessage("network:insert", requested))
+            return LuaValue.FALSE
+        }
+        if (budget.moveTimeLeftNanos(tick) > 0L) return null
+        if (!atomic) return LuaValue.valueOf(0)
+        reportMoveFailure("network:insert:time", NetworkBudget.moveTimeMessage("network:insert"))
+        return LuaValue.FALSE
     }
 
     /** Drain [requested] items from a CPU buffer into network storage. Atomic mode
@@ -1479,12 +1724,13 @@ class ScriptEngine(
         // best-effort clamps and charges only what actually moved.
         val tick = PlatformServices.modState.tickCount
         val budget = NetworkRateLimits.forNetwork(snapshot.controller?.networkId)
+        moveGate(budget, tick, requested, atomic)?.let { return it }
         val available = budget.availableItems(tick)
         if (available < requested) {
-            if (budget.warnOnce(NetworkBudget.WARN_ITEMS_MOVED)) {
-                logCallback("[items moved rate-limited this tick on this network]", true)
+            if (atomic) {
+                reportMoveFailure("network:insert:limit", NetworkBudget.itemLimitMessage("network:insert", requested, available))
+                return LuaValue.FALSE
             }
-            if (atomic) return LuaValue.FALSE
             if (available <= 0L) return LuaValue.valueOf(0)
         }
         val clamped = minOf(requested, available)
@@ -1506,6 +1752,7 @@ class ScriptEngine(
                 if (inserted == 0L) break
             }
             if (totalInserted < extracted) {
+                reportMoveFailure("network:insert:space", "network:insert moved nothing: not enough space, only $totalInserted of the $extracted items fit.")
                 // Partial commit. `atomic=false` must mean "nothing moved",
                 // so pull placed items back out and return all to the buffer.
                 if (totalInserted > 0L) {
@@ -1532,20 +1779,23 @@ class ScriptEngine(
             return LuaValue.TRUE
         }
 
-        var totalMoved = 0L
-        var remaining = clamped
-        while (remaining > 0L) {
-            val batch = minOf(remaining, maxStack)
-            val extracted = bufSrc.extract(batch)
-            if (extracted == 0L) break
-            val stack = capturedTemplate.copyWithCount(extracted.toInt())
-            val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, inventoryCache, channel).toLong()
-            totalMoved += inserted
-            if (inserted < extracted) {
-                bufSrc.returnUnused(extracted - inserted)
-                break
+        val totalMoved = budget.timedMove(tick, atomic = false) {
+            var moved = 0L
+            var remaining = clamped
+            while (remaining > 0L && !damien.nodeworks.platform.MoveDeadline.expired()) {
+                val batch = minOf(remaining, maxStack)
+                val extracted = bufSrc.extract(batch)
+                if (extracted == 0L) break
+                val stack = capturedTemplate.copyWithCount(extracted.toInt())
+                val inserted = NetworkStorageHelper.insertItemStack(level, snapshot, stack, inventoryCache, channel).toLong()
+                moved += inserted
+                if (inserted < extracted) {
+                    bufSrc.returnUnused(extracted - inserted)
+                    break
+                }
+                remaining -= inserted
             }
-            remaining -= inserted
+            moved
         }
         budget.noteItemsMoved(tick, totalMoved)
         return LuaValue.valueOf(totalMoved.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
@@ -1729,7 +1979,7 @@ class ScriptEngine(
                                 } else null
                             }
                         }
-                        return ItemsHandle.toLuaTable(ItemsHandle.fromItemInfo(aggregatedInfo, filter, sourceStorage, level))
+                        return ItemsHandle.toLuaTable(ItemsHandle.fromItemInfo(aggregatedInfo, filter, sourceStorage, level, ItemsHandle.Origin.Pool(null)))
                     }
                 }
                 if (kindGate == null || kindGate == damien.nodeworks.platform.ResourceKind.FLUID) {
@@ -1747,7 +1997,7 @@ class ScriptEngine(
                                 } else null
                             }
                         }
-                        return ItemsHandle.toLuaTable(ItemsHandle.fromFluidInfo(aggregated, filter, fluidSource, level))
+                        return ItemsHandle.toLuaTable(ItemsHandle.fromFluidInfo(aggregated, filter, fluidSource, level, ItemsHandle.Origin.Pool(null)))
                     }
                 }
                 return LuaValue.NIL
@@ -1782,7 +2032,7 @@ class ScriptEngine(
                                 } else null
                             }
                         }
-                        val handle = ItemsHandle.fromItemInfo(info, info.itemId, sourceStorage, level)
+                        val handle = ItemsHandle.fromItemInfo(info, info.itemId, sourceStorage, level, ItemsHandle.Origin.Pool(null))
                         result.set(idx++, ItemsHandle.toLuaTable(handle))
                     }
                 }
@@ -1806,7 +2056,7 @@ class ScriptEngine(
                                 } else null
                             }
                         }
-                        val handle = ItemsHandle.fromFluidInfo(info, "\$fluid:${info.fluidId}", fluidSource, level)
+                        val handle = ItemsHandle.fromFluidInfo(info, "\$fluid:${info.fluidId}", fluidSource, level, ItemsHandle.Origin.Pool(null))
                         result.set(idx++, ItemsHandle.toLuaTable(handle))
                     }
                 }
@@ -1964,12 +2214,14 @@ class ScriptEngine(
                     }
                     val id = net.minecraft.resources.Identifier.tryParse(cr.outputItemId)
                     val item = if (id != null) net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id) else null
+                    val template = cpu.getBufferTemplate(damien.nodeworks.script.BufferKey.Key(cr.outputItemId, ""))
                     if (item != null) {
                         val maxStack = item.getDefaultMaxStackSize().toLong()
                         var stillRemaining = remaining
                         while (stillRemaining > 0L) {
                             val batch = minOf(stillRemaining, maxStack).toInt()
-                            val stack = net.minecraft.world.item.ItemStack(item, batch)
+                            val stack = template?.takeIf { it.item == item }?.copyWithCount(batch)
+                                ?: net.minecraft.world.item.ItemStack(item, batch)
                             net.minecraft.world.Containers.dropItemStack(
                                 level,
                                 cpu.blockPos.x + 0.5,
@@ -2135,6 +2387,13 @@ class ScriptEngine(
                 processingHandlers[name] = handler
                 return LuaValue.NIL
             }
+        })
+
+        // network:recipes(rules...) → RecipeMatcher, then :handle(fn) runs every matching
+        // Processing Set through one function. See [handlerFor] for who wins an overlap.
+        networkTable.setGuarded("Network", "recipes", object : VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs =
+                recipeMatcherTable(damien.nodeworks.script.preset.RuleSet.rulesFromArgs(args, 2))
         })
 
         // (network:var was removed, variables are now first-class members of the

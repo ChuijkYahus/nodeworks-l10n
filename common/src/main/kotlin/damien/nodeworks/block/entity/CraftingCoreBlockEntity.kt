@@ -3,7 +3,9 @@ package damien.nodeworks.block.entity
 import damien.nodeworks.network.Connectable
 import damien.nodeworks.network.NodeConnectionHelper
 import damien.nodeworks.registry.ModBlockEntities
+import damien.nodeworks.platform.PlatformServices
 import damien.nodeworks.script.cpu.BufferState
+import damien.nodeworks.script.cpu.CoolantRating
 import damien.nodeworks.script.cpu.CpuOpExecutor
 import damien.nodeworks.script.cpu.CpuRules
 import damien.nodeworks.script.cpu.CraftPlan
@@ -54,8 +56,10 @@ class CraftingCoreBlockEntity(
             //  needs its blockstate re-pushed. recalculateCapacity() walks the
             //  cluster and calls setBlock only where the desired state differs,
             //  so this is cheap when nothing changed.
+            // Deferred to the tick so the scan's network walk runs after propagation
+            // has finished assigning ids, never in the middle of it.
             if (changed && level != null && !level!!.isClientSide) {
-                recalculateCapacity()
+                requestRecalculate()
             }
         }
 
@@ -79,6 +83,39 @@ class CraftingCoreBlockEntity(
     /** The scheduler that drives all in-flight crafts for this CPU.
      *  Currently single-threaded, Co-Processor blocks will add threads. */
     val scheduler: CraftScheduler = CraftScheduler(threadCount = 1, executor = opExecutor)
+
+    companion object {
+        /** How often an idle CPU tries to move leftover buffer contents to storage. */
+        private const val IDLE_DRAIN_TICKS = 20L
+        private var pushDepth = 0
+
+        /** True while a Core writes formed and overheat blockstates into its structure.
+         *  Those writes fire neighbor updates on every component, and a component hook
+         *  must not answer them with another structure scan: the layout did not change,
+         *  only its lights did. With two Cores on one structure that answer fed itself
+         *  until the server crawled. */
+        val pushingStates: Boolean get() = pushDepth > 0
+    }
+
+    /** The other Core that drives the structure this Core is part of, null when this
+     *  Core drives it (or stands alone). A driven Core stays unformed and idle. */
+    var drivenBy: BlockPos? = null
+        private set
+
+    /** Persisted so the Core that formed a structure first keeps it across reloads. */
+    private var claimsStructure: Boolean = false
+
+    /** Set by block hooks, consumed by [serverTick]. Every neighbor update of a placement
+     *  asks for a rescan, so one tick's worth of requests collapses into one scan. */
+    @Transient
+    private var recalcRequested: Boolean = false
+
+    /** Rescan the structure on the next server tick. Hooks call this rather than
+     *  [recalculateCapacity] so a single block change costs one scan, not one per
+     *  notified neighbor, and so a block being destroyed is gone by the time we look. */
+    fun requestRecalculate() {
+        recalcRequested = true
+    }
 
     /** Number of Co-Processor blocks discovered in the last multiblock scan. */
     var coProcessorCount: Int = 0
@@ -127,16 +164,14 @@ class CraftingCoreBlockEntity(
      * is idle, otherwise queues. [onComplete] fires exactly once when the plan
      * reaches DONE (true) or FAILED (false). Safe to call from any server-side context.
      */
+    /** Told the running total of root items delivered ahead of the plan's end. */
+    fun registerProgressListener(plan: CraftPlan, onProgress: (Long) -> Unit) {
+        opExecutor.registerProgressListener(plan, onProgress)
+    }
+
     fun submitCraft(plan: CraftPlan, currentTick: Long, onComplete: ((Boolean) -> Unit)? = null) {
-        // Wipe ALL stale resume info, opIds are plan-scoped (planner starts at 0) and any
-        // entry left over from a previous craft will collide with this plan's op IDs and
-        // incorrectly trigger the resume path (which skips handler invocation).
-        // The save/load resume flow does NOT go through here, it restores the same plan
-        // it saved, with the matching opResumeInfo intact, via NBT.
-        if (opResumeInfo.isNotEmpty()) {
-            opResumeInfo.clear()
-            setChanged()
-        }
+        // Stale per-op state is wiped by [clearOpState] when the plan actually starts, so a
+        // plan queued behind a running one never touches the running plan's state.
         onComplete?.let { opExecutor.registerCompletionListener(plan, it) }
         scheduler.submit(plan, currentTick)
         setCrafting(true, plan.rootItemId.substringAfter(':').replace('_', ' '))
@@ -153,9 +188,79 @@ class CraftingCoreBlockEntity(
     fun serverTick(level: ServerLevel) {
         if (!capacityInitialized) {
             capacityInitialized = true
+            recalcRequested = false
+            recalculateCapacity()
+            rebuildResumedQueueEntries()
+        } else if (recalcRequested) {
+            recalcRequested = false
             recalculateCapacity()
         }
         scheduler.tick(level.gameTime)
+        if (level.gameTime % IDLE_DRAIN_TICKS == 0L) drainIdleBuffer(level)
+    }
+
+    /** Items in the buffer with no plan left to deliver them, a job's over-capacity holds
+     *  after its plan ended, a sweep that lost its room, go to network storage once a
+     *  second while the CPU is idle, so nothing sits in an idle buffer longer than storage
+     *  is full. A plan running or queued, a resumed one included, and a scripted craft
+     *  waiting for its callback still own their buffer and are left alone. */
+    private fun drainIdleBuffer(level: ServerLevel) {
+        if (isCrafting || !scheduler.isIdle || scheduler.queuedPlans.isNotEmpty() || drivenBy != null) return
+        if (bufferState.count <= 0L) return
+        val snap = damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, worldPosition)
+        var moved = false
+        for ((key, entry) in bufferState.contents()) {
+            var left = entry.count
+            while (left > 0L) {
+                val n = minOf(left, entry.template.maxStackSize.toLong()).toInt()
+                val inserted = damien.nodeworks.script.NetworkStorageHelper.insertItemStack(level, snap, entry.template.copyWithCount(n), null)
+                if (inserted <= 0) break
+                removeFromBuffer(key, inserted.toLong())
+                left -= inserted
+                moved = true
+            }
+        }
+        if (!moved) return
+        if (bufferState.count <= 0L && lastFailureReason.startsWith("Buffer over capacity")) lastFailureReason = ""
+        setChanged()
+    }
+
+    /** Re-register terminal craft-queue rows for plans restored from NBT.
+     *  The queue and completion listeners are memory only, so a resumed
+     *  craft would otherwise run headless. Scripted crafts (omitDeliver)
+     *  never had a row, the executor's flush fallback covers them. A
+     *  matching pending row (chunk reloaded mid-session) is reused so it
+     *  gets a fresh listener instead of a duplicate. */
+    private fun rebuildResumedQueueEntries() {
+        val plans = listOfNotNull(scheduler.currentPlan) + scheduler.queuedPlans
+        for (plan in plans) {
+            val submitter = plan.submitterUuid ?: continue
+            if (plan.omitDeliver) continue
+            val entry = damien.nodeworks.screen.CraftQueueManager.getQueue(submitter).firstOrNull {
+                it.networkId == networkId && it.itemId == plan.rootItemId && !it.isComplete
+            } ?: damien.nodeworks.screen.CraftQueueManager.addEntry(
+                submitter,
+                networkId,
+                plan.rootItemId,
+                net.minecraft.resources.Identifier.tryParse(plan.rootItemId)?.path?.replace('_', ' ')
+                    ?: plan.rootItemId,
+                plan.rootCount.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+            )
+            // What trickled out before the reload is still the player's.
+            val delivered = plan.ops.firstOrNull { it is damien.nodeworks.script.cpu.Operation.Deliver && it.id in plan.terminalOpIds }
+                ?.let { (it as damien.nodeworks.script.cpu.Operation.Deliver).delivered } ?: 0L
+            if (delivered > 0L) {
+                entry.deliveredCount = delivered.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                entry.dirty = true
+            }
+            opExecutor.registerProgressListener(plan) { total ->
+                entry.deliveredCount = total.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                entry.dirty = true
+            }
+            opExecutor.registerCompletionListener(plan) { success ->
+                damien.nodeworks.screen.CraftQueueManager.finishEntry(submitter, entry, success)
+            }
+        }
     }
 
     /** Total items currently held (Long-safe for networks with billions of items). */
@@ -281,10 +386,19 @@ class CraftingCoreBlockEntity(
      *
      *  [outputs] pairs a template [ItemStack] (carrying variant components)
      *  with the remaining count so a resumed poll matches the exact variant. */
+    /** An output a resumed job still collects: what, how many more, and how many one
+     *  machine operation makes, which is what tells a bonus copy from a guaranteed one. */
+    data class ResumeOutput(val template: net.minecraft.world.item.ItemStack, val remaining: Long, val perOp: Int)
+
     data class OpResumeInfo(
         val processingApiName: String,
         val outputs: List<Pair<net.minecraft.world.item.ItemStack, Long>>,
-        val pullTargets: List<Pair<BlockPos, net.minecraft.core.Direction>>
+        val pullTargets: List<Pair<BlockPos, net.minecraft.core.Direction>>,
+        /** Per-operation count of each entry in [outputs]. Empty for saves from before it
+         *  was recorded, which then count the whole remainder as one operation. */
+        val outputsPerOp: List<Int> = emptyList(),
+        /** Optional outputs still being collected. */
+        val optionals: List<ResumeOutput> = emptyList(),
     )
 
     /** Keyed by Operation.id. Persisted across save/load. */
@@ -309,6 +423,34 @@ class CraftingCoreBlockEntity(
         if (opResumeInfo.remove(opId) != null) setChanged()
     }
 
+    /** Recipe batches of a parallel Process op that a block handler runs in chunks, as many
+     *  as the machine takes at once. [inFlight] batches are in the machine. [fit] is the chunk
+     *  size a Lua handler tries next, 0 to try everything left. Saved so a reload mid-request
+     *  carries on with the remaining chunks. */
+    data class ChunkProgress(val total: Long, val done: Long, val inFlight: Long, val fit: Long = 0L)
+
+    /** Keyed by Operation.id. Persisted across save/load. */
+    val opChunkProgress: MutableMap<Int, ChunkProgress> = mutableMapOf()
+
+    fun setChunkProgress(opId: Int, progress: ChunkProgress) {
+        opChunkProgress[opId] = progress
+        setChanged()
+    }
+
+    fun clearChunkProgress(opId: Int) {
+        if (opChunkProgress.remove(opId) != null) setChanged()
+    }
+
+    /** Wipe all per-op state. Op IDs restart at 0 each plan, so entries left from an earlier
+     *  plan would collide with the next plan's ops and wrongly trigger the resume path. */
+    fun clearOpState() {
+        if (opResumeInfo.isNotEmpty() || opChunkProgress.isNotEmpty()) {
+            opResumeInfo.clear()
+            opChunkProgress.clear()
+            setChanged()
+        }
+    }
+
     /** Wipe all pending job metadata (but keep originalCraft, cleared by clearAllCraftState). */
     fun clearPendingJob() {
         if (pendingOutputs.isNotEmpty() || pendingCount > 0 || pendingPullTargets.isNotEmpty()) {
@@ -325,12 +467,9 @@ class CraftingCoreBlockEntity(
         originalCraftCount = 0L
         craftTreeSnapshot = null
         clearPendingJob()
-        // Op IDs are plan-scoped (planner starts at 0). Stale entries would collide with
-        // the next plan's op IDs and incorrectly trigger the resume path.
-        if (opResumeInfo.isNotEmpty()) {
-            opResumeInfo.clear()
-            setChanged()
-        }
+        // A plan that already started owns the per-op state, and the next plan clears it
+        // when it starts anyway.
+        if (scheduler.currentPlan == null) clearOpState()
     }
 
     // =====================================================================
@@ -349,12 +488,32 @@ class CraftingCoreBlockEntity(
         return true
     }
 
+    /** Puts [count] of [stack] in the buffer whatever its capacity, and tells the player
+     *  why. For a job's outputs that are already out of the machine and have nowhere
+     *  else to go. The buffer is over its limit until a Deliver or the plan's end drains
+     *  it, and the craft carries on. */
+    fun addToBufferForced(stack: net.minecraft.world.item.ItemStack, count: Long, networkFull: Boolean) {
+        bufferState.insertForced(stack, count)
+        lastFailureReason = if (networkFull)
+            "Buffer over capacity and the network has no space for outputs. Holding them until storage frees up."
+        else
+            "Buffer over capacity. Holding outputs until space frees up."
+        setChanged()
+    }
+
     /** Component-aware buffer insertion. Use this when the caller has a real
      *  [ItemStack] (e.g. just pulled from storage) so durability / potion
      *  contents / dye colour / enchantments live in the buffer template
      *  instead of being stripped by the itemId-only overload. */
     fun addToBuffer(stack: net.minecraft.world.item.ItemStack, count: Long): Boolean {
         if (!bufferState.insert(stack, count)) return false
+        setChanged()
+        return true
+    }
+
+    /** Add a crafting result to [itemId]'s plain bucket, keeping [stack]'s components. */
+    fun addCraftedToBuffer(itemId: String, stack: net.minecraft.world.item.ItemStack, count: Long): Boolean {
+        if (!bufferState.insertCrafted(itemId, stack, count)) return false
         setChanged()
         return true
     }
@@ -451,6 +610,8 @@ class CraftingCoreBlockEntity(
      * [CpuComponentBlockEntity] and accumulates per-type contributions.
      *
      * Capped by [CpuRules.COMPONENTS_PER_CPU_CAP] to bound work on chunk load.
+     *
+     * Runs synchronously. Block hooks go through [requestRecalculate] instead.
      */
     fun recalculateCapacity() {
         var totalCount = CpuRules.CORE_BASE_COUNT
@@ -466,10 +627,9 @@ class CraftingCoreBlockEntity(
         // Heat value per heat-gen, so we can count which heat is "reached" by Stabilizers.
         val heatByPosition = HashMap<BlockPos, Int>()
         val substratePositions = HashSet<BlockPos>()
-        // HashSet so the per-heat-gen loop can test face-neighbor membership in O(1).
-        val stabilizerPositions = HashSet<BlockPos>()
         val coProcessorPositions = ArrayList<BlockPos>()
         val bufferPositions = ArrayList<BlockPos>()
+        val rivals = ArrayList<CraftingCoreBlockEntity>()
 
         val visited = mutableSetOf(worldPosition)
         val queue = ArrayDeque<BlockPos>()
@@ -482,7 +642,24 @@ class CraftingCoreBlockEntity(
                 val neighbor = pos.relative(dir)
                 if (neighbor in visited) continue
                 visited.add(neighbor)
-                val entity = level?.getBlockEntity(neighbor) ?: continue
+                val entity = level?.getBlockEntity(neighbor)
+                if (entity !is CraftingCoreBlockEntity && entity !is CpuComponentBlockEntity) {
+                    // Connecting coolant carries the structure without contributing to it,
+                    // whether or not the block has an entity of its own. Its cooling is
+                    // still counted by the adjacency pass below.
+                    val lvl = level
+                    if (lvl != null && CpuComponentBlockEntity.connectsThrough(lvl, neighbor)) {
+                        queue.add(neighbor)
+                        discovered++
+                    }
+                    continue
+                }
+                if (entity is CraftingCoreBlockEntity) {
+                    // Reached through a component, so it shares our structure. Two Cores
+                    // touching face to face with no component between them stay separate.
+                    if (pos != worldPosition) rivals.add(entity)
+                    continue
+                }
                 if (entity is CpuComponentBlockEntity) {
                     queue.add(neighbor)
                     discovered++
@@ -502,9 +679,6 @@ class CraftingCoreBlockEntity(
                             heatGenPositions.add(neighbor)
                             heatByPosition[neighbor] = entity.heat
                             coProcessorPositions.add(neighbor)
-                        }
-                        is StabilizerBlockEntity -> {
-                            stabilizerPositions.add(neighbor)
                         }
                         is SubstrateBlockEntity -> {
                             totalTypes += CpuRules.SUBSTRATE_TYPE_CONTRIBUTION
@@ -538,17 +712,35 @@ class CraftingCoreBlockEntity(
         // bonus from adjacent stabilizers), then divide that output across its heat-gen
         // face-neighbors. The resulting per-face contribution is what each touched
         // heat-gen receives from this particular stabilizer face.
+        val coolantCache = HashMap<BlockPos, CoolantRating?>()
+        fun coolantAt(p: BlockPos): CoolantRating? {
+            if (p in heatGenPositions || p == worldPosition) return null
+            if (coolantCache.containsKey(p)) return coolantCache[p]
+            val lvl = level ?: return null
+            val rating = if (lvl.isLoaded(p)) PlatformServices.coolantRating(lvl.getBlockState(p)) else null
+            coolantCache[p] = rating
+            return rating
+        }
+        // HashSet so the per-heat-gen loop can test face-neighbor membership in O(1).
+        val coolantPositions = HashSet<BlockPos>()
+        for (pos in heatGenPositions) {
+            for (dir in net.minecraft.core.Direction.entries) {
+                val n = pos.relative(dir)
+                if (coolantAt(n) != null) coolantPositions.add(n)
+            }
+        }
         val stabContributionPerFace = HashMap<BlockPos, Float>()
-        for (pos in stabilizerPositions) {
+        for (pos in coolantPositions) {
+            val rating = coolantAt(pos) ?: continue
             var stabNeighbors = 0
             var heatGenNeighbors = 0
             for (dir in net.minecraft.core.Direction.entries) {
                 val n = pos.relative(dir)
-                if (n in stabilizerPositions) stabNeighbors++
-                else if (n in heatGenPositions) heatGenNeighbors++
+                if (n in heatGenPositions) heatGenNeighbors++
+                else if (coolantAt(n) != null) stabNeighbors++
             }
             if (heatGenNeighbors <= 0) continue  // stabilizer with no heat-gen contact does nothing
-            val output = CpuRules.STABILIZER_BASE_COOLING + stabNeighbors * CpuRules.STABILIZER_CLUSTER_BONUS
+            val output = rating.baseCooling + stabNeighbors * rating.clusterBonus
             stabContributionPerFace[pos] = output / heatGenNeighbors
         }
 
@@ -583,10 +775,15 @@ class CraftingCoreBlockEntity(
         }
         val totalCooled = totalCooledFloat.toInt()
 
-        // "Formed" now also requires an active network membership, disconnecting the
-        //  Core from the laser network flips this false, which drives every cluster
-        //  block to swap its emissive-on model for the plain one.
-        isFormed = bufferCount > 0 && networkId != null
+        // Formed also requires a Network Controller on the network. A Node-anchored
+        // network has an id without one, and autocrafting stays a controller feature,
+        // so the check asks the network rather than the id. Losing the controller
+        // flips this false, which swaps every cluster block to its plain model.
+        drivenBy = resolveDriver(rivals)
+        val serverLevel = level as? ServerLevel
+        val hasController = networkId != null && serverLevel != null &&
+            damien.nodeworks.network.NetworkDiscovery.discoverNetwork(serverLevel, worldPosition).hasController
+        isFormed = drivenBy == null && bufferCount > 0 && hasController
         coProcessorCount = coProcessors
         heatGenerated = totalHeat
         heatCooled = totalCooled
@@ -604,14 +801,42 @@ class CraftingCoreBlockEntity(
         }
         // Push formed + overheating flags out to each heat-gen component so emissive
         // variants reflect cooling status per block. Only issues setBlock when the
-        // state actually changes.
-        updateHeatGenBlockStates(
-            coProcessorPositions, bufferPositions,
-            isFormed, overheatLevelByPosition
-        )
+        // state actually changes. A driven Core leaves the components to their driver,
+        // otherwise the two would overwrite each other's formed flag forever.
+        pushDepth++
+        try {
+            if (drivenBy == null) {
+                updateHeatGenBlockStates(
+                    coProcessorPositions, bufferPositions,
+                    isFormed, overheatLevelByPosition
+                )
+            }
+            updateBlockState()
+        } finally {
+            pushDepth--
+        }
 
         markDirtyAndSync()
-        updateBlockState()
+    }
+
+    /** Exactly one Core drives a structure. The Core that already claims it keeps it,
+     *  so adding a second Core to a working CPU parks the new one and leaves the CPU
+     *  alone. When several claim it (two formed CPUs joined by a new block, or a world
+     *  saved before this rule) the lowest Core wins, by Y, then X, then Z. Returns the
+     *  driver's position, or null when this Core drives. */
+    private fun resolveDriver(rivals: List<CraftingCoreBlockEntity>): BlockPos? {
+        val claimers = rivals.filter { it.claimsStructure }
+        if (claimers.isEmpty()) {
+            claimsStructure = true
+            return null
+        }
+        val candidates = if (claimsStructure) claimers + this else claimers
+        val winner = candidates.minWith(
+            compareBy({ it.worldPosition.y }, { it.worldPosition.x }, { it.worldPosition.z })
+        )
+        if (winner === this) return null
+        claimsStructure = false
+        return winner.worldPosition
     }
 
     private fun updateHeatGenBlockStates(
@@ -838,6 +1063,32 @@ class CraftingCoreBlockEntity(
         setCrafting(false)
     }
 
+    /** Runs when the block is replaced by anything, a player, a mining laser, an
+     *  explosion or a command, and never on chunk or world unload, which does not go
+     *  through a block change. The buffer is dropped here so no removal path can eat
+     *  a running job's ingredients, and never on unload, which used to drop them when
+     *  a player walked away. The component-aware flush keeps potions, dyed armor and
+     *  named items as the exact variants the buffer held. */
+    override fun preRemoveSideEffects(pos: BlockPos, state: BlockState) {
+        super.preRemoveSideEffects(pos, state)
+        val lvl = level ?: return
+        if (lvl.isClientSide) return
+        blockDestroyed = true
+        for ((_, bucket) in clearBufferComponentAware()) {
+            val template = bucket.template
+            if (template.isEmpty) continue
+            val maxStack = template.item.getDefaultMaxStackSize().toLong()
+            var remaining = bucket.count
+            while (remaining > 0L) {
+                val dropCount = minOf(remaining, maxStack).toInt()
+                net.minecraft.world.Containers.dropItemStack(
+                    lvl, pos.x + 0.5, pos.y + 0.5, pos.z + 0.5, template.copyWithCount(dropCount),
+                )
+                remaining -= dropCount.toLong()
+            }
+        }
+    }
+
     override fun setRemoved() {
         damien.nodeworks.render.NodeConnectionRenderer.trackConnectable(level, worldPosition, false)
         val lvl = level
@@ -861,6 +1112,8 @@ class CraftingCoreBlockEntity(
         super.saveAdditional(output)
         output.putBlockPosList("connections", connections)
         output.putBoolean("isFormed", isFormed)
+        output.putBoolean("claims", claimsStructure)
+        drivenBy?.let { output.store("drivenBy", BlockPos.CODEC, it) }
         output.putBoolean("isCrafting", isCrafting)
         output.putString("currentCraftItem", currentCraftItem)
         if (lastFailureReason.isNotEmpty()) output.putString("lastFailureReason", lastFailureReason)
@@ -914,10 +1167,21 @@ class CraftingCoreBlockEntity(
                 c.putInt("op", opId)
                 c.putString("api", info.processingApiName)
                 val outsList = c.childrenList("outputs")
-                for ((template, ct) in info.outputs) {
+                for ((i, out) in info.outputs.withIndex()) {
+                    val (template, ct) = out
                     val o = outsList.addChild()
                     o.store("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC, template)
                     o.putLong("ct", ct)
+                    info.outputsPerOp.getOrNull(i)?.let { o.putInt("op", it) }
+                }
+                if (info.optionals.isNotEmpty()) {
+                    val optList = c.childrenList("optionals")
+                    for (out in info.optionals) {
+                        val o = optList.addChild()
+                        o.store("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC, out.template)
+                        o.putLong("ct", out.remaining)
+                        o.putInt("op", out.perOp)
+                    }
                 }
                 val tgtsList = c.childrenList("targets")
                 for ((pos, face) in info.pullTargets) {
@@ -927,6 +1191,17 @@ class CraftingCoreBlockEntity(
                 }
             }
         }
+        if (opChunkProgress.isNotEmpty()) {
+            val list = output.childrenList("opChunkProgress")
+            for ((opId, p) in opChunkProgress) {
+                val c = list.addChild()
+                c.putInt("op", opId)
+                c.putLong("total", p.total)
+                c.putLong("done", p.done)
+                c.putLong("inFlight", p.inFlight)
+                c.putLong("fit", p.fit)
+            }
+        }
     }
 
     override fun loadAdditional(input: ValueInput) {
@@ -934,13 +1209,15 @@ class CraftingCoreBlockEntity(
         connections.clear()
         connections.addAll(input.getBlockPosList("connections"))
         isFormed = input.getBooleanOr("isFormed", false)
+        claimsStructure = input.getBooleanOr("claims", false)
+        drivenBy = input.read("drivenBy", BlockPos.CODEC).orElse(null)
         isCrafting = input.getBooleanOr("isCrafting", false)
         currentCraftItem = input.getStringOr("currentCraftItem", "")
         lastFailureReason = input.getStringOr("lastFailureReason", "")
         networkId = input.getStringOrNull("networkId")?.takeIf { it.isNotEmpty() }?.let {
             try { UUID.fromString(it) } catch (_: Exception) { null }
         }
-        damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
+        if (level != null) damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(worldPosition)
 
         // [level] isn't set yet during loadAdditional (Vanilla calls
         // [setLevel] AFTER load), but [ValueInput.lookup] carries the
@@ -1015,6 +1292,7 @@ class CraftingCoreBlockEntity(
             if (opId < 0) continue
             val api = c.getStringOr("api", "")
             val outputs = ArrayList<Pair<net.minecraft.world.item.ItemStack, Long>>()
+            val outputsPerOp = ArrayList<Int>()
             for (o in c.childrenListOrEmpty("outputs")) {
                 val ct = o.getLongOr("ct", 0L)
                 val stack = o.read("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC)
@@ -1029,6 +1307,13 @@ class CraftingCoreBlockEntity(
                     }
                     ?: continue
                 outputs += stack to ct
+                outputsPerOp += o.getIntOr("op", ct.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt())
+            }
+            val optionals = ArrayList<ResumeOutput>()
+            for (o in c.childrenListOrEmpty("optionals")) {
+                val stack = o.read("stack", net.minecraft.world.item.ItemStack.OPTIONAL_CODEC)
+                    .orElse(null)?.takeIf { !it.isEmpty } ?: continue
+                optionals += ResumeOutput(stack, o.getLongOr("ct", 0L), o.getIntOr("op", 1))
             }
             val targets = ArrayList<Pair<BlockPos, net.minecraft.core.Direction>>()
             for (t in c.childrenListOrEmpty("targets")) {
@@ -1038,13 +1323,21 @@ class CraftingCoreBlockEntity(
                 if (f !in faces.indices) continue
                 targets += BlockPos.of(p) to faces[f]
             }
-            opResumeInfo[opId] = OpResumeInfo(api, outputs, targets)
+            opResumeInfo[opId] = OpResumeInfo(api, outputs, targets, outputsPerOp, optionals)
         }
         // Defensive cleanup: opResumeInfo entries reference op IDs that only mean anything
         // within the loaded scheduler plan. If no plan (or different ops), drop them.
         val planOpIds = scheduler.currentPlan?.ops?.map { it.id }?.toSet().orEmpty()
         if (opResumeInfo.keys.any { it !in planOpIds }) {
             opResumeInfo.keys.retainAll(planOpIds)
+        }
+        opChunkProgress.clear()
+        for (c in input.childrenListOrEmpty("opChunkProgress")) {
+            val opId = c.getIntOr("op", -1)
+            if (opId !in planOpIds) continue
+            opChunkProgress[opId] = ChunkProgress(
+                c.getLongOr("total", 0L), c.getLongOr("done", 0L), c.getLongOr("inFlight", 0L), c.getLongOr("fit", 0L),
+            )
         }
     }
 

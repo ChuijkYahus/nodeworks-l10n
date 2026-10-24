@@ -16,7 +16,7 @@ import net.minecraft.world.item.DyeColor
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.Items
 import net.minecraft.world.level.block.Block
-import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.LiquidBlock
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.storage.ValueInput
@@ -138,9 +138,9 @@ class BreakerBlockEntity(
      *  started so [BreakerHandle.break] can return a live builder vs a no-op. */
     fun startBreak(level: ServerLevel, handler: LuaFunction? = null): Boolean {
         if (isBreaking) return false
-        // Inert without a Controller-rooted network, mirrors Placer / User.
+        // Inert off the network, mirrors Placer / User. A Node-anchored network counts.
         val snapshot = damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, worldPosition)
-        if (snapshot.controller == null) return false
+        if (snapshot.networkId == null) return false
         val target = targetPos
         val state = level.getBlockState(target)
         val duration = computeBreakDuration(level, target, state) ?: return false
@@ -215,7 +215,7 @@ class BreakerBlockEntity(
         if (!redstoneAllows(level)) return
         val target = targetPos
         val state = level.getBlockState(target)
-        if (state.isAir) return
+        if (!isBreakableTarget(state)) return
         val effective = filterRule.ifEmpty { "*" }
         val blockId = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.block).toString()
         if (!damien.nodeworks.script.CardHandle.matchesFilter(blockId, effective)) return
@@ -273,7 +273,7 @@ class BreakerBlockEntity(
 
         // Remove the block. UPDATE_ALL fires neighbor updates so connected redstone
         // / pistons / observers see the change.
-        level.setBlock(target, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL)
+        level.setBlock(target, level.getFluidState(target).createLegacyBlock(), Block.UPDATE_ALL)
 
         // Tree felling. Drops accumulate into [drops] so a felled tree is
         // indistinguishable from a single break to downstream routing.
@@ -309,7 +309,7 @@ class BreakerBlockEntity(
 
     private fun breakOneForFell(level: ServerLevel, pos: BlockPos, sink: MutableList<ItemStack>) {
         val state = level.getBlockState(pos)
-        if (state.isAir) return
+        if (!isBreakableTarget(state)) return
         if (!PlatformServices.fakePlayer.mayBreak(level, pos, state, ownerUuid)) return
         // Empty-tool fallback hits the loot table's no-tool branch for leaves
         // (saplings + sticks), pickToolPair gives diamond axe for logs.
@@ -319,7 +319,7 @@ class BreakerBlockEntity(
         // UPDATE_CLIENTS only, skip the neighbour-update cascade so a 500-block
         // fell doesn't trigger redstone/observer/leaf-decay churn on every
         // adjacent block. The cut pos already fired UPDATE_ALL above.
-        level.setBlock(pos, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS)
+        level.setBlock(pos, level.getFluidState(pos).createLegacyBlock(), Block.UPDATE_CLIENTS)
     }
 
     private fun markDirtyAndSync() {
@@ -412,7 +412,7 @@ class BreakerBlockEntity(
         ownerUuid = input.getStringOrNull("ownerUuid")?.takeIf { it.isNotEmpty() }?.let {
             try { UUID.fromString(it) } catch (_: Exception) { null }
         }
-        damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
+        if (level != null) damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(worldPosition)
         connections.clear()
         connections.addAll(input.getBlockPosList("connections"))
     }
@@ -433,13 +433,17 @@ class BreakerBlockEntity(
          *  in lockstep. */
         const val IDLE_POLL_INTERVAL_TICKS = 20
 
+        /** Fluids are ignored, a waterlogged solid block is still a target. */
+        fun isBreakableTarget(state: BlockState): Boolean =
+            !state.isAir && state.block !is LiquidBlock
+
         /** Pick a diamond / wooden tool pair appropriate for [state]. Tries
-         *  pickaxe, axe, then shovel and returns the first whose diamond
-         *  variant is the correct tool for drops. Null when none of the three
-         *  match (block needs a non-mining tool like shears, or is above
-         *  diamond tier). The wooden variant of the same class drives the
-         *  break-speed formula, so wood breaks at wooden-axe speed, dirt at
-         *  wooden-shovel speed, etc. */
+         *  pickaxe, axe, shovel, then hoe, returning the first whose diamond
+         *  variant is correct for drops. Blocks needing no tool at all
+         *  (glass, wool, moss carpet) get a bare-hand pair so drops hit the
+         *  no-tool loot branch. Null when no class fits (shears-only, or
+         *  above diamond tier). The wooden variant drives the break-speed
+         *  formula. */
         fun pickToolPair(state: BlockState): Pair<ItemStack, ItemStack>? {
             val pick = ItemStack(Items.DIAMOND_PICKAXE)
             if (pick.isCorrectToolForDrops(state)) return pick to ItemStack(Items.WOODEN_PICKAXE)
@@ -447,6 +451,9 @@ class BreakerBlockEntity(
             if (axe.isCorrectToolForDrops(state)) return axe to ItemStack(Items.WOODEN_AXE)
             val shovel = ItemStack(Items.DIAMOND_SHOVEL)
             if (shovel.isCorrectToolForDrops(state)) return shovel to ItemStack(Items.WOODEN_SHOVEL)
+            val hoe = ItemStack(Items.DIAMOND_HOE)
+            if (hoe.isCorrectToolForDrops(state)) return hoe to ItemStack(Items.WOODEN_HOE)
+            if (!state.requiresCorrectToolForDrops()) return ItemStack.EMPTY to ItemStack.EMPTY
             return null
         }
 
@@ -459,7 +466,7 @@ class BreakerBlockEntity(
          *  above-tier (no matching diamond tool). Callers treat null as a silent
          *  no-op, matches the user's preference for failed breaks not to spam errors. */
         fun computeBreakDuration(level: net.minecraft.world.level.Level, pos: BlockPos, state: BlockState): Int? {
-            if (state.isAir) return null
+            if (!isBreakableTarget(state)) return null
             val (_, woodenTool) = pickToolPair(state) ?: return null
             val hardness = state.getDestroySpeed(level, pos)
             if (hardness < 0f) return null
@@ -467,7 +474,9 @@ class BreakerBlockEntity(
             // Floor at 1.0 so a 0-speed reading (modded edges where the tool's
             // class doesn't apply at all) still yields a finite tick count.
             val woodSpeed = rawWoodSpeed.coerceAtLeast(1f)
-            val canHarvestWithWood = woodenTool.isCorrectToolForDrops(state)
+            // No required tool means anything harvests, including the
+            // bare-hand pair whose empty stack has no tool component.
+            val canHarvestWithWood = woodenTool.isCorrectToolForDrops(state) || !state.requiresCorrectToolForDrops()
             // Three-tier divisor scales the per-tick damage:
             //   - wooden harvests fully (e.g., cobblestone): fast path (30)
             //   - wooden's class applies but wrong tier (vanilla iron ore, obsidian): 100

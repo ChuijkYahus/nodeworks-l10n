@@ -89,6 +89,25 @@ object NeoForgeClientSetup {
             damien.nodeworks.item.NetworkWrenchItem.clientSelectedPos = null
         }
 
+        // Build autocomplete id lists in the background before any screen needs them.
+        // The client-side tag event fires on the client thread on join and /reload, in
+        // singleplayer too. Login is a fallback in case tags were bound before it fired.
+        NeoForge.EVENT_BUS.addListener { _: net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent.LoggingIn ->
+            damien.nodeworks.client.RegistryIdCache.preload()
+            // Saved terminal channels go up now, so opening a terminal never waits on them.
+            // Skipped on servers without Nodeworks, which don't know the packet.
+            val saved = damien.nodeworks.config.ClientConfig.invTerminalChannels()
+            val type = damien.nodeworks.network.InvTerminalChannelPrefsPayload.TYPE
+            if (saved.isNotEmpty() && net.minecraft.client.Minecraft.getInstance().connection?.hasChannel(type) == true) {
+                damien.nodeworks.platform.PlatformServices.clientNetworking.sendToServer(
+                    damien.nodeworks.network.InvTerminalChannelPrefsPayload(saved)
+                )
+            }
+        }
+        NeoForge.EVENT_BUS.addListener { _: net.neoforged.neoforge.event.TagsUpdatedEvent.ClientPacketReceived ->
+            damien.nodeworks.client.RegistryIdCache.preload()
+        }
+
         // Block other mods (JEI) from stealing key events when our terminal editor is active.
         // JEI hooks into ScreenEvent.KeyPressed.Pre which fires before Screen.keyPressed().
         // We cancel the event to prevent JEI from seeing it, then manually forward to our screen.
@@ -107,6 +126,12 @@ object NeoForgeClientSetup {
                 screen.charTyped(event.characterEvent)
                 event.isCanceled = true
             }
+        }
+
+        // Pre, not Post: vanilla handles keybinds inside Minecraft.tick, and the
+        // Portable hotkey must eat the paired inventory click before that runs.
+        NeoForge.EVENT_BUS.addListener { _: net.neoforged.neoforge.client.event.ClientTickEvent.Pre ->
+            NodeworksKeyBindings.tickOpenPortable()
         }
 
         // Polls keyUse each client tick so we can fire a release packet on
@@ -130,6 +155,11 @@ object NeoForgeClientSetup {
     }
 
     private fun onClientSetup(event: FMLClientSetupEvent) {
+        // The variant hash encodes components through their codecs. The client has no
+        // server on a dedicated server, so it reads registries from the level it is in.
+        damien.nodeworks.script.BufferKey.clientRegistryProvider = {
+            net.minecraft.client.Minecraft.getInstance().level?.registryAccess()
+        }
         event.enqueueWork {
             // Initialize client config
             damien.nodeworks.config.ClientConfig.init(net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get().toFile())
@@ -161,7 +191,8 @@ object NeoForgeClientSetup {
         event.registerBlockEntityRenderer(ModBlockEntities.NODE, ::NodeRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.FOCUS_NODE, ::FocusNodeRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.PIPE, ::PipeRenderer)
-        event.registerBlockEntityRenderer(ModBlockEntities.PROCESSING_HANDLER, ::ProcessingHandlerRenderer)
+        event.registerBlockEntityRenderer(ModBlockEntities.PROCESSING_HANDLER) { ctx -> ProcessingHandlerRenderer(ctx) }
+        event.registerBlockEntityRenderer(ModBlockEntities.MULTI_PROCESSING_HANDLER) { ctx -> ProcessingHandlerRenderer(ctx) }
         event.registerBlockEntityRenderer(ModBlockEntities.MONITOR, ::MonitorRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.STORAGE_METER, ::StorageMeterRenderer)
         event.registerBlockEntityRenderer(ModBlockEntities.CRAFT_REQUESTER, ::CraftRequesterRenderer)
@@ -550,6 +581,9 @@ object NeoForgeClientSetup {
         event.register(ModScreenHandlers.STORAGE_CARD) { menu, inventory, title ->
             damien.nodeworks.screen.StorageCardScreen(menu, inventory, title)
         }
+        event.register(ModScreenHandlers.TRANSFER_CARD) { menu, inventory, title ->
+            damien.nodeworks.screen.TransferCardScreen(menu, inventory, title)
+        }
         event.register(ModScreenHandlers.CARD_SETTINGS) { menu, inventory, title ->
             damien.nodeworks.screen.CardSettingsScreen(menu, inventory, title)
         }
@@ -570,6 +604,9 @@ object NeoForgeClientSetup {
         }
         event.register(ModScreenHandlers.PROCESSING_HANDLER) { menu, inventory, title ->
             damien.nodeworks.screen.ProcessingHandlerScreen(menu, inventory, title)
+        }
+        event.register(ModScreenHandlers.MULTI_PROCESSING_HANDLER) { menu, inventory, title ->
+            damien.nodeworks.screen.MultiProcessingHandlerScreen(menu, inventory, title)
         }
         event.register(ModScreenHandlers.STORAGE_METER) { menu, inventory, title ->
             damien.nodeworks.screen.StorageMeterScreen(menu, inventory, title)

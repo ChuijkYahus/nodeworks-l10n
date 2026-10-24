@@ -29,9 +29,13 @@ object NodeworksServerConfig {
     val MAX_VARIABLE_WRITES_PER_TICK: ModConfigSpec.IntValue
     val MAX_ERROR_LOGS_PER_TICK: ModConfigSpec.IntValue
     val MAX_ITEMS_MOVED_PER_TICK_PER_NETWORK: ModConfigSpec.IntValue
+    val MAX_ITEMS_PER_PRESET_RUN: ModConfigSpec.IntValue
+    val MAX_ITEM_MOVE_MS_PER_TICK_PER_NETWORK: ModConfigSpec.IntValue
     val MAX_CALLBACKS_PER_KIND: ModConfigSpec.IntValue
+    val MULTI_HANDLER_MAX_SETS: ModConfigSpec.IntValue
     val ENABLED_MODULES: ModConfigSpec.ConfigValue<List<String>>
     val DISABLED_METHODS: ModConfigSpec.ConfigValue<List<String>>
+    val OBSERVER_DENIED_BLOCKS: ModConfigSpec.ConfigValue<List<String>>
     val USER_DENIED_ITEMS: ModConfigSpec.ConfigValue<List<String>>
     val NETWORK_CONTROLLER_CHUNK_LOADING: ModConfigSpec.BooleanValue
     val GRAPPLE_MAX_DISTANCE: ModConfigSpec.IntValue
@@ -242,17 +246,47 @@ object NodeworksServerConfig {
 
         MAX_ITEMS_MOVED_PER_TICK_PER_NETWORK = builder
             .comment(
-                " Max items moved per tick per network across all network:insert and",
-                " network:tryInsert calls. Independent of maxItemMoveCallsPerTick (a",
-                " single call can move 64 items, so call count != item count). 0 means",
-                " unlimited. When exhausted, tryInsert returns partial counts and atomic",
-                " insert short-circuits to false."
+                " Max items moved per tick per network across all script insert and",
+                " tryInsert calls. Independent of maxItemMoveCallsPerTick (a single call",
+                " can move many items, so call count != item count). When exhausted,",
+                " tryInsert silently moves what it can and insert fails with an error in the",
+                " terminal. The default of 16384 is 256 full stacks per tick. 0 also means",
+                " 16384, this one has no unlimited setting."
             )
             .defineInRange(
                 "maxItemsMovedPerTickPerNetwork",
                 ServerSafetySettings.Defaults.maxItemsMovedPerTickPerNetwork.toInt(),
                 0,
                 Int.MAX_VALUE,
+            )
+
+        MAX_ITEMS_PER_PRESET_RUN = builder
+            .comment(
+                " Max items one importer or stocker run moves. Separate from",
+                " maxItemsMovedPerTickPerNetwork, each preset gets its own allowance per run.",
+                " A run that hits it stops and the rest moves on later runs. 0, or anything",
+                " above 16384, means 16384, this one has no unlimited setting."
+            )
+            .defineInRange(
+                "maxItemsPerPresetRun",
+                ServerSafetySettings.Defaults.maxItemsPerPresetRun.toInt(),
+                0,
+                Int.MAX_VALUE,
+            )
+
+        MAX_ITEM_MOVE_MS_PER_TICK_PER_NETWORK = builder
+            .comment(
+                " Milliseconds per tick per network that tryInsert moves may spend, and the time",
+                " each importer or stocker run gets. A move that runs out stops and keeps what",
+                " already moved, the rest moves on later ticks. This is the backstop for storages",
+                " slow enough that even maxItemsMovedPerTickPerNetwork items take too long, so it",
+                " can't be turned off."
+            )
+            .defineInRange(
+                "maxItemMoveMsPerTickPerNetwork",
+                ServerSafetySettings.Defaults.maxItemMoveMsPerTickPerNetwork.toInt(),
+                1,
+                50,
             )
 
         builder.pop()
@@ -272,6 +306,18 @@ object NodeworksServerConfig {
                 ServerSafetySettings.Defaults.maxCallbacksPerKind,
                 0,
                 100_000,
+            )
+
+        MULTI_HANDLER_MAX_SETS = builder
+            .comment(
+                " Processing Sets one Multi-Processing Handler may own. Raising it lets one",
+                " block drive more recipes through the same machines."
+            )
+            .defineInRange(
+                "multiHandlerMaxSets",
+                ServerSafetySettings.Defaults.multiHandlerMaxSets,
+                1,
+                64,
             )
 
         builder.pop()
@@ -311,7 +357,7 @@ object NodeworksServerConfig {
                 "   Scheduler          global scheduler table (scheduler:tick, second, delay, cancel)",
                 "   CardHandle         storage card methods (insert, tryInsert, find, findEach, count, face, slots)",
                 "   RedstoneCard       redstone card methods (powered, strength, set, onChange)",
-                "   ObserverCard       observer card methods (block, state, onChange)",
+                "   ObserverCard       observer card methods (block, state, data, energy, onChange)",
                 "   VariableHandle     variable card methods (get, set, cas, increment, decrement, etc.)",
                 "   PlacerHandle       placer methods (place, block, isBlocked)",
                 "   BreakerHandle      breaker methods (mine, cancel, block, state, isMining, progress)",
@@ -325,6 +371,22 @@ object NodeworksServerConfig {
                 "disabledMethods",
                 ServerSafetySettings.Defaults.disabledMethods.toList(),
                 { "Network:insert" },
+            ) { it is String }
+
+        OBSERVER_DENIED_BLOCKS = builder
+            .comment(
+                " Blocks whose data `ObserverCard:data()` won't read, for blocks you",
+                " don't want scripts to see the internals of. Bare ids match exactly,",
+                " entries starting with `#` match a block tag. Reading a listed block",
+                " throws an error in the script. To turn off `data()` everywhere,",
+                " add \"ObserverCard:data\" to disabledMethods instead.",
+                " Example: [\"nodeworks:terminal\", \"#c:chests\"]",
+                " Empty list = no restrictions."
+            )
+            .defineListAllowEmpty(
+                "observerDeniedBlocks",
+                ServerSafetySettings.Defaults.observerDeniedBlocks,
+                { "minecraft:chest" },
             ) { it is String }
 
         builder.pop()
@@ -408,9 +470,13 @@ object NodeworksServerConfig {
         maxVariableWritesPerTick = MAX_VARIABLE_WRITES_PER_TICK.get(),
         maxErrorLogsPerTick = MAX_ERROR_LOGS_PER_TICK.get(),
         maxItemsMovedPerTickPerNetwork = MAX_ITEMS_MOVED_PER_TICK_PER_NETWORK.get().toLong(),
+        maxItemsPerPresetRun = MAX_ITEMS_PER_PRESET_RUN.get().toLong(),
+        maxItemMoveMsPerTickPerNetwork = MAX_ITEM_MOVE_MS_PER_TICK_PER_NETWORK.get().toLong(),
         maxCallbacksPerKind = MAX_CALLBACKS_PER_KIND.get(),
+        multiHandlerMaxSets = MULTI_HANDLER_MAX_SETS.get(),
         enabledModules = ENABLED_MODULES.get().toSet(),
         disabledMethods = DISABLED_METHODS.get().toSet(),
+        observerDeniedBlocks = OBSERVER_DENIED_BLOCKS.get().toList(),
         userDeniedItems = USER_DENIED_ITEMS.get().toList(),
         networkControllerChunkLoading = NETWORK_CONTROLLER_CHUNK_LOADING.get(),
         grappleMaxDistance = GRAPPLE_MAX_DISTANCE.get(),

@@ -58,10 +58,20 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         // Initialize platform services BEFORE any registration
         PlatformServices.blockEntity = NeoForgeBlockEntityService()
         PlatformServices.menu = NeoForgeMenuService()
-        PlatformServices.storage = NeoForgeStorageService()
+        PlatformServices.storage = damien.nodeworks.platform.CompositeStorageService(NeoForgeStorageService())
         PlatformServices.modState = NeoForgeModStateService()
+        // The variant hash encodes components through their codecs, which needs the
+        // server's registries. Null before the server exists, the hash then falls back.
+        damien.nodeworks.script.BufferKey.registryProvider = {
+            net.neoforged.neoforge.server.ServerLifecycleHooks.getCurrentServer()?.registryAccess()
+        }
         PlatformServices.fakePlayer = damien.nodeworks.platform.NeoForgeFakePlayerService()
+        PlatformServices.crafting = damien.nodeworks.platform.NeoForgeCraftingHookService()
         PlatformServices.serverNetworking = NeoForgeServerNetworkingService()
+        PlatformServices.coolantRating = damien.nodeworks.registry.NodeworksDataMaps::coolantRating
+
+        // Optional Curios slot for the Portable, a no-op without Curios.
+        damien.nodeworks.compat.curios.CuriosCompat.init()
 
         // Register the server-scoped config. Per-world file at
         // `serverconfig/nodeworks-server.toml` is auto-generated on first load
@@ -83,6 +93,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         // hoppers and the Export Chest's push side can't see them as inventories.
         modBus.addListener(::onRegisterCapabilities)
 
+        modBus.addListener(damien.nodeworks.registry.NodeworksDataMaps::register)
+
         // Register game events on the NeoForge event bus
         NeoForge.EVENT_BUS.addListener(::onServerTick)
         NeoForge.EVENT_BUS.addListener(::onServerStarting)
@@ -92,6 +104,10 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         NeoForge.EVENT_BUS.addListener(::onRegisterCommands)
         NeoForge.EVENT_BUS.addListener(::onDatapackSync)
         NeoForge.EVENT_BUS.addListener(::onBlockBreak)
+        // A tag rule in `network:recipes` may match other sets once tags change.
+        NeoForge.EVENT_BUS.addListener { _: net.neoforged.neoforge.event.TagsUpdatedEvent ->
+            damien.nodeworks.script.RecipeHandlerRule.onTagsReloaded()
+        }
 
         // Register client setup (bypasses KFF's AutoKotlinEventBusSubscriber). Gated
         // on `Dist.CLIENT` because [NeoForgeClientSetup.register] eagerly calls
@@ -276,6 +292,14 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                     damien.nodeworks.screen.StorageCardMenu.clientFactory(syncId, inv, data)
                 }
             )
+            ModScreenHandlers.TRANSFER_CARD = Registry.register(
+                BuiltInRegistries.MENU,
+                ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "transfer_card")),
+                IMenuTypeExtension.create { syncId, inv, buf ->
+                    val data = damien.nodeworks.screen.TransferCardOpenData.STREAM_CODEC.decode(buf)
+                    damien.nodeworks.screen.TransferCardMenu.clientFactory(syncId, inv, data)
+                }
+            )
             ModScreenHandlers.CARD_SETTINGS = Registry.register(
                 BuiltInRegistries.MENU,
                 ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "card_settings")),
@@ -330,6 +354,14 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 IMenuTypeExtension.create { syncId, inv, buf ->
                     val data = damien.nodeworks.screen.ProcessingHandlerOpenData.STREAM_CODEC.decode(buf)
                     damien.nodeworks.screen.ProcessingHandlerMenu.clientFactory(syncId, inv, data)
+                }
+            )
+            ModScreenHandlers.MULTI_PROCESSING_HANDLER = Registry.register(
+                BuiltInRegistries.MENU,
+                ResourceKey.create(Registries.MENU, Identifier.fromNamespaceAndPath("nodeworks", "multi_processing_handler")),
+                IMenuTypeExtension.create { syncId, inv, buf ->
+                    val data = damien.nodeworks.screen.MultiProcessingHandlerOpenData.STREAM_CODEC.decode(buf)
+                    damien.nodeworks.screen.MultiProcessingHandlerMenu.clientFactory(syncId, inv, data)
                 }
             )
             ModScreenHandlers.STORAGE_METER = Registry.register(
@@ -404,6 +436,15 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 }
             }
         }
+        registrar.playToServer(
+            damien.nodeworks.network.OpenPortableTerminalPayload.TYPE,
+            damien.nodeworks.network.OpenPortableTerminalPayload.CODEC,
+        ) { _, context ->
+            context.enqueueWork {
+                val player = context.player() as? net.minecraft.server.level.ServerPlayer ?: return@enqueueWork
+                damien.nodeworks.item.PortableTerminalOpener.openFromInventory(player)
+            }
+        }
         registrar.playToServer(InvTerminalSlotClickPayload.TYPE, InvTerminalSlotClickPayload.CODEC) { payload, context ->
             context.enqueueWork {
                 val player = context.player()
@@ -437,6 +478,19 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 val menu = player.containerMenu
                 if (menu is damien.nodeworks.screen.InventoryTerminalMenu && menu.containerId == payload.containerId) {
                     menu.handleCraftGridAction(player, payload.action)
+                }
+            }
+        }
+        registrar.playToServer(InvTerminalChannelPrefsPayload.TYPE, InvTerminalChannelPrefsPayload.CODEC) { payload, context ->
+            context.enqueueWork {
+                damien.nodeworks.screen.InvTerminalChannelPrefs.replace(context.player().uuid, payload.entries, damien.nodeworks.platform.PlatformServices.modState.tickCount)
+            }
+        }
+        registrar.playToServer(InvTerminalSetChannelPayload.TYPE, InvTerminalSetChannelPayload.CODEC) { payload, context ->
+            context.enqueueWork {
+                val menu = context.player().containerMenu
+                if (menu is damien.nodeworks.screen.InventoryTerminalMenu && menu.containerId == payload.containerId) {
+                    menu.selectChannel(damien.nodeworks.network.ChannelFilter.fromNbtInt(payload.channel))
                 }
             }
         }
@@ -628,6 +682,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                             menu.fuzzy = payload.value != 0
                             menu.markDirty()
                         }
+                        "optional" -> menu.setOutputOptional(payload.slotIndex, payload.value != 0)
+                        "clear" -> menu.clearAll()
                     }
                 }
             }
@@ -648,7 +704,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             context.enqueueWork {
                 val player = context.player()
                 val menu = player.containerMenu
-                if (menu is damien.nodeworks.screen.StorageCardMenu && menu.containerId == payload.containerId) {
+                if (menu is damien.nodeworks.screen.FilterRuleMenu && menu.containerId == payload.containerId) {
                     menu.replaceFilterRules(payload.rules)
                 }
             }
@@ -742,6 +798,46 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             }
         }
 
+        // Multi-Processing Handler GUI -> server messages, same 8 m gate.
+        registrar.playToServer(
+            damien.nodeworks.network.MultiProcessingHandlerTogglePayload.TYPE,
+            damien.nodeworks.network.MultiProcessingHandlerTogglePayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player() as? net.minecraft.server.level.ServerPlayer ?: return@enqueueWork
+                val level = player.level() as ServerLevel
+                if (!player.blockPosition().closerThan(payload.pos, 8.0)) return@enqueueWork
+                val entity = level.getBlockEntity(payload.pos) as? damien.nodeworks.block.entity.MultiProcessingHandlerBlockEntity ?: return@enqueueWork
+                // The block entity sync carries the new bound list, the screen reads it live.
+                damien.nodeworks.screen.MultiProcessingHandlerServerLogic.toggle(level, entity, payload.processingApiName, payload.selected)
+            }
+        }
+        registrar.playToServer(
+            damien.nodeworks.network.MultiProcessingHandlerSetChannelPayload.TYPE,
+            damien.nodeworks.network.MultiProcessingHandlerSetChannelPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val level = player.level() as? ServerLevel ?: return@enqueueWork
+                if (!player.blockPosition().closerThan(payload.pos, 8.0)) return@enqueueWork
+                val entity = level.getBlockEntity(payload.pos) as? damien.nodeworks.block.entity.MultiProcessingHandlerBlockEntity ?: return@enqueueWork
+                val color = runCatching { net.minecraft.world.item.DyeColor.byId(payload.channelId) }.getOrNull() ?: return@enqueueWork
+                if (payload.output) entity.setOutputChannel(color) else entity.setInputChannel(color)
+            }
+        }
+        registrar.playToServer(
+            damien.nodeworks.network.MultiProcessingHandlerSetParallelPayload.TYPE,
+            damien.nodeworks.network.MultiProcessingHandlerSetParallelPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val level = player.level() as? ServerLevel ?: return@enqueueWork
+                if (!player.blockPosition().closerThan(payload.pos, 8.0)) return@enqueueWork
+                val entity = level.getBlockEntity(payload.pos) as? damien.nodeworks.block.entity.MultiProcessingHandlerBlockEntity ?: return@enqueueWork
+                entity.setParallel(payload.enabled)
+            }
+        }
+
         registrar.playToServer(SetCardNamePayload.TYPE, SetCardNamePayload.CODEC) { payload, context ->
             context.enqueueWork {
                 val player = context.player()
@@ -749,6 +845,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                     is damien.nodeworks.screen.StorageCardMenu ->
                         if (menu.containerId == payload.containerId) menu.setCardName(player, payload.name)
                     is damien.nodeworks.screen.CardSettingsMenu ->
+                        if (menu.containerId == payload.containerId) menu.setCardName(player, payload.name)
+                    is damien.nodeworks.screen.TransferCardMenu ->
                         if (menu.containerId == payload.containerId) menu.setCardName(player, payload.name)
                 }
             }
@@ -838,12 +936,40 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             }
         }
 
+        registrar.playToServer(
+            damien.nodeworks.network.ProcessingSetGhostClickPayload.TYPE,
+            damien.nodeworks.network.ProcessingSetGhostClickPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val menu = player.containerMenu
+                if (menu is damien.nodeworks.screen.ProcessingSetScreenHandler && menu.containerId == payload.containerId &&
+                    (payload.button == 0 || payload.button == 1)
+                ) {
+                    menu.applyGhostClick(payload.index, payload.isOutput, payload.button == 1)
+                }
+            }
+        }
+
         registrar.playToServer(SetProcessingApiSlotPayload.TYPE, SetProcessingApiSlotPayload.CODEC) { payload, context ->
             context.enqueueWork {
                 val player = context.player()
                 val menu = player.containerMenu
                 if (menu is damien.nodeworks.screen.ProcessingSetScreenHandler && menu.containerId == payload.containerId) {
                     menu.setSlotFromStack(payload.slotIndex, payload.stack)
+                }
+            }
+        }
+
+        registrar.playToServer(
+            damien.nodeworks.network.SetProcessingApiSlotTagPayload.TYPE,
+            damien.nodeworks.network.SetProcessingApiSlotTagPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val menu = player.containerMenu
+                if (menu is damien.nodeworks.screen.ProcessingSetScreenHandler && menu.containerId == payload.containerId) {
+                    menu.setInputTag(payload.slotIndex, payload.tagId.takeIf { it.isNotEmpty() })
                 }
             }
         }
@@ -899,10 +1025,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         }
         registrar.playToClient(InventorySyncPayload.TYPE, InventorySyncPayload.CODEC) { payload, context ->
             context.enqueueWork {
-                val screen = net.minecraft.client.Minecraft.getInstance().screen
-                if (screen is damien.nodeworks.screen.InventoryTerminalScreen) {
-                    screen.repo.handleUpdate(payload)
-                }
+                damien.nodeworks.screen.InventoryTerminalScreen.liveScreen()?.repo?.handleUpdate(payload)
             }
         }
         registrar.playToClient(BufferSyncPayload.TYPE, BufferSyncPayload.CODEC) { payload, context ->
@@ -927,9 +1050,17 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 
         registrar.playToClient(CraftRequestErrorPayload.TYPE, CraftRequestErrorPayload.CODEC) { payload, context ->
             context.enqueueWork {
-                val screen = net.minecraft.client.Minecraft.getInstance().screen
-                if (screen is damien.nodeworks.screen.InventoryTerminalScreen) {
-                    screen.setCraftError(payload.message)
+                damien.nodeworks.screen.InventoryTerminalScreen.liveScreen()?.setCraftError(payload.message)
+            }
+        }
+
+        registrar.playToClient(InvTerminalNetworkPayload.TYPE, InvTerminalNetworkPayload.CODEC) { payload, context ->
+            context.enqueueWork {
+                val player = net.minecraft.client.Minecraft.getInstance().player ?: return@enqueueWork
+                val menu = player.containerMenu
+                if (menu is damien.nodeworks.screen.InventoryTerminalMenu && menu.containerId == payload.containerId) {
+                    menu.networkId = runCatching { java.util.UUID.fromString(payload.networkId) }.getOrNull()
+                    damien.nodeworks.screen.InventoryTerminalScreen.liveScreen()?.onNetworkSynced()
                 }
             }
         }
@@ -983,10 +1114,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 
         registrar.playToClient(CraftQueueSyncPayload.TYPE, CraftQueueSyncPayload.CODEC) { payload, context ->
             context.enqueueWork {
-                val screen = net.minecraft.client.Minecraft.getInstance().screen
-                if (screen is damien.nodeworks.screen.InventoryTerminalScreen) {
-                    screen.handleQueueSync(payload)
-                }
+                val screen = damien.nodeworks.screen.InventoryTerminalScreen.liveScreen() ?: return@enqueueWork
+                if (screen.menu.containerId == payload.containerId) screen.handleQueueSync(payload)
             }
         }
 
@@ -1009,8 +1138,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                     if (!level.isLoaded(pos)) continue
                     val be = level.getBlockEntity(pos) as? damien.nodeworks.network.Connectable ?: continue
                     be.networkId = payload.newId
+                    damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(pos)
                 }
-                damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(payload.newId)
             }
         }
 
@@ -1047,6 +1176,18 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 menu.applyStateSync(payload.data)
             }
         }
+
+        registrar.playToClient(
+            damien.nodeworks.network.MultiProcessingHandlerStateSyncPayload.TYPE,
+            damien.nodeworks.network.MultiProcessingHandlerStateSyncPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = net.minecraft.client.Minecraft.getInstance().player ?: return@enqueueWork
+                val menu = player.containerMenu as? damien.nodeworks.screen.MultiProcessingHandlerMenu ?: return@enqueueWork
+                if (menu.devicePos != payload.data.pos) return@enqueueWork
+                menu.applyStateSync(payload.data)
+            }
+        }
     }
 
     private fun onServerTick(event: ServerTickEvent.Post) {
@@ -1056,6 +1197,12 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         for (cache in damien.nodeworks.script.NetworkInventoryCache.getAll()) {
             cache.tick()
         }
+        damien.nodeworks.script.NetworkInventoryCache.evictOrphans(tickCount.toLong())
+        damien.nodeworks.script.NetworkRateLimits.evictIdle(tickCount.toLong())
+        // One slice of the variant hash memo's sweep, so it progresses on a quiet network
+        // and never has to walk the whole memo in one go.
+        damien.nodeworks.script.BufferKey.sweepSlice()
+        damien.nodeworks.block.entity.TransferCardTicker.tickAll(event.server.allLevels)
         for (level in event.server.allLevels) {
             damien.nodeworks.script.MonitorUpdateHelper.tick(level, tickCount)
         }
@@ -1121,6 +1268,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         // load via ProcessingHandlerBlockEntity.setLevel, so a fresh index
         // is the right starting state for the next world load.
         damien.nodeworks.script.cpu.BlockHandlerRegistry.reset()
+        damien.nodeworks.script.cpu.HandlerReservations.reset()
         // Drop cached SavedData handles, a restart in the same JVM (integrated server quit+rejoin)
         // must re-resolve them against the freshly loaded level.dataStorage.
         damien.nodeworks.network.NodeConnectionHelper.clearServerCaches()
@@ -1130,6 +1278,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         // Drop per-network rate-limit budgets so a quit-and-rejoin doesn't carry
         // stale tick counters into the new session.
         damien.nodeworks.script.NetworkRateLimits.clearAll()
+        damien.nodeworks.network.NetworkIds.clearRetired()
+        damien.nodeworks.block.entity.TransferCardTicker.clear()
     }
 
     private fun onPlayerDisconnect(event: net.neoforged.neoforge.event.entity.player.PlayerEvent.PlayerLoggedOutEvent) {
@@ -1137,6 +1287,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         diagnosticPreviewLastTick.remove(event.entity.uuid)
         deviceSettingsLastTick.remove(event.entity.uuid)
         damien.nodeworks.item.GrappleBeamSessions.clearForPlayer(event.entity.uuid)
+        damien.nodeworks.screen.InvTerminalChannelPrefs.clear(event.entity.uuid)
     }
 
     private fun onRightClickBlock(event: net.neoforged.neoforge.event.entity.player.PlayerInteractEvent.RightClickBlock) {
@@ -1209,7 +1360,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             }
         }
         logger.info(
-            "Nodeworks server config loaded: topLevelSoftAbort={}ms callbackSoftAbort={}ms localTickBudget={}ms globalTickBudget={}ms instructionsPerCheck={} maxItemMoveCalls={} maxPlacements={} maxRedstoneWrites={} maxVariableWrites={} maxPrints={} maxErrorLogs={} maxItemsMovedPerTick={} maxCallbacksPerKind={}",
+            "Nodeworks server config loaded: topLevelSoftAbort={}ms callbackSoftAbort={}ms localTickBudget={}ms globalTickBudget={}ms instructionsPerCheck={} maxItemMoveCalls={} maxPlacements={} maxRedstoneWrites={} maxVariableWrites={} maxPrints={} maxErrorLogs={} maxItemsMovedPerTick={} maxItemsPerPresetRun={} maxItemMoveMs={} maxCallbacksPerKind={}",
             newSettings.topLevelSoftAbortMs,
             newSettings.callbackSoftAbortMs,
             newSettings.localTickBudgetMs,
@@ -1222,6 +1373,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             newSettings.maxPrintsPerTick,
             newSettings.maxErrorLogsPerTick,
             newSettings.maxItemsMovedPerTickPerNetwork,
+            newSettings.maxItemsPerPresetRun,
+            newSettings.maxItemMoveMsPerTickPerNetwork,
             newSettings.maxCallbacksPerKind,
         )
     }
@@ -1257,6 +1410,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 class NeoForgeModStateService : ModStateService {
     override val tickCount: Long get() = Nodeworks.tickCount
 
+    override fun isModLoaded(modId: String): Boolean = net.neoforged.fml.ModList.get().isLoaded(modId)
+
     override fun isScriptRunning(level: ServerLevel, pos: BlockPos): Boolean {
         return NeoForgeTerminalPackets.getEngine(level, pos)?.isRunning() == true
     }
@@ -1286,8 +1441,9 @@ class NeoForgeModStateService : ModStateService {
         terminalPositions: List<BlockPos>,
         cardName: String,
         overrideDimension: net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level>?,
+        api: damien.nodeworks.block.entity.ProcessingStorageBlockEntity.ProcessingApiInfo?,
     ): Any? {
-        return NeoForgeTerminalPackets.findEngineWithHandler(level, terminalPositions, cardName, overrideDimension)
+        return NeoForgeTerminalPackets.findEngineWithHandler(level, terminalPositions, cardName, overrideDimension, api)
     }
 
     override fun getScriptEngine(level: ServerLevel, pos: BlockPos): Any? {

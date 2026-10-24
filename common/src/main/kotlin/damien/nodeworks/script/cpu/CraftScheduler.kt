@@ -33,6 +33,9 @@ class CraftScheduler(
         object Completed : OpResult()
         /** Async op still running. Scheduler leaves it pending, re-invokes next tick. */
         object InProgress : OpResult()
+        /** Op could not start, its handler is taken, and has set its own ready time. It
+         *  holds no thread until then, so the slot goes to other ready work. */
+        object Deferred : OpResult()
         /** Op failed. Scheduler aborts the plan with [reason]. */
         data class Failed(val reason: String) : OpResult()
     }
@@ -53,6 +56,10 @@ class CraftScheduler(
         /** Fired once per [CraftScheduler.tick] after all execute, completion, and failure
          *  handlers ran. Pair with [onTickStart] to bound per-tick caches. */
         fun onTickEnd() {}
+
+        /** Called when a fresh plan becomes the running plan, from an idle submit or the
+         *  backlog. Never called for a plan restored from a save. */
+        fun onPlanStarted(plan: CraftPlan) {}
 
         /** Called when a plan reaches the DONE state (all terminal ops completed). */
         fun onPlanCompleted(plan: CraftPlan) {}
@@ -163,6 +170,9 @@ class CraftScheduler(
                             op.inProgress = true
                             // Op stays in readyOps for future ticks, slot was spent here.
                         }
+                        is OpResult.Deferred -> {
+                            op.inProgress = false
+                        }
                         is OpResult.Failed -> {
                             val p = plan
                             state = State.FAILED
@@ -209,6 +219,7 @@ class CraftScheduler(
             op.inProgress = false
         }
         state = if (p.ops.isEmpty()) State.DONE else State.RUNNING
+        executor.onPlanStarted(p)
     }
 
     private fun reset() {
@@ -265,20 +276,30 @@ class CraftScheduler(
         }
         // All sync ops upfront.
         picked += syncOps
-        if (limit <= 0) return picked
-        // Process ops bounded by limit, preferring distinct APIs.
-        val usedApis = HashSet<String>()
+        // In-flight Process ops hold their slot and are always polled, so a finished one is
+        // noticed right away instead of waiting behind a newly ready op earlier in the plan.
+        val inFlight = processOps.filter { it.inProgress }
+        picked += inFlight
+        val free = limit - inFlight.size
+        if (free <= 0) return picked
+        // New Process ops fill the free slots, preferring distinct APIs.
+        val usedApis = inFlight.mapTo(HashSet()) { it.processingApiName }
+        var started = 0
         for (op in processOps) {
-            if (picked.size - syncOps.size >= limit) break
+            if (started >= free) break
+            if (op.inProgress) continue
             if (op.processingApiName !in usedApis) {
                 picked += op
                 usedApis += op.processingApiName
+                started++
             }
         }
-        if (picked.size - syncOps.size < limit) {
+        if (started < free) {
             for (op in processOps) {
-                if (picked.size - syncOps.size >= limit) break
-                if (op !in picked) picked += op
+                if (started >= free) break
+                if (op.inProgress || op in picked) continue
+                picked += op
+                started++
             }
         }
         return picked

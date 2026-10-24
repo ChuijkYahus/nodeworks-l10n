@@ -24,15 +24,18 @@ import net.minecraft.world.level.block.BaseEntityBlock
 import net.minecraft.world.level.block.Block
 import net.minecraft.world.level.block.RenderShape
 import net.minecraft.world.level.block.entity.BlockEntity
+import net.minecraft.world.level.block.SimpleWaterloggedBlock
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.block.state.StateDefinition
+import net.minecraft.world.level.material.FluidState
+import net.minecraft.world.level.material.Fluids
 import net.minecraft.world.level.block.state.properties.BooleanProperty
 import net.minecraft.world.phys.BlockHitResult
 import net.minecraft.world.phys.shapes.CollisionContext
 import net.minecraft.world.phys.shapes.Shapes
 import net.minecraft.world.phys.shapes.VoxelShape
 
-open class NodeBlock(properties: Properties) : BaseEntityBlock(properties) {
+open class NodeBlock(properties: Properties) : BaseEntityBlock(properties), SimpleWaterloggedBlock {
 
     init {
         registerDefaultState(
@@ -43,6 +46,7 @@ open class NodeBlock(properties: Properties) : BaseEntityBlock(properties) {
                 .setValue(PIPE_SOUTH, false)
                 .setValue(PIPE_WEST, false)
                 .setValue(PIPE_EAST, false)
+                .setValue(WATERLOGGED, false)
         )
     }
 
@@ -208,6 +212,8 @@ open class NodeBlock(properties: Properties) : BaseEntityBlock(properties) {
             }
             if (emptySlot == -1) return InteractionResult.TRY_WITH_EMPTY_HAND
             if (level.isClientSide) return InteractionResult.SUCCESS
+            // Read before shrinking, the last card in hand leaves an empty stack whose item is AIR.
+            val card = stack.item as damien.nodeworks.card.NodeCard
             be.setStack(target.side, emptySlot, stack.copyWithCount(1))
             if (!player.abilities.instabuild) stack.shrink(1)
             level.playSound(
@@ -216,7 +222,7 @@ open class NodeBlock(properties: Properties) : BaseEntityBlock(properties) {
                 net.minecraft.sounds.SoundSource.BLOCKS,
                 1.0f, 1.0f,
             )
-            spawnCardPlacementPuff(level, target.nodePos, target.side, stack.item as damien.nodeworks.card.NodeCard)
+            spawnCardPlacementPuff(level, target.nodePos, target.side, card)
             return InteractionResult.SUCCESS
         }
 
@@ -252,6 +258,7 @@ open class NodeBlock(properties: Properties) : BaseEntityBlock(properties) {
         private fun cardTypeColor(type: String): Int = when (type) {
             "io" -> 0x83E086        // green
             "storage" -> 0xAA83E0   // purple
+            "transfer" -> 0x4FA3FF  // blue
             "redstone" -> 0xF53B68  // red
             "observer" -> 0xFFEB3B  // yellow
             else -> 0xFFFFFF        // unrecognised cards fall back to white
@@ -261,11 +268,12 @@ open class NodeBlock(properties: Properties) : BaseEntityBlock(properties) {
     override fun codec(): MapCodec<out BaseEntityBlock> = CODEC
 
     override fun createBlockStateDefinition(builder: StateDefinition.Builder<Block, BlockState>) {
-        builder.add(PIPE_DOWN, PIPE_UP, PIPE_NORTH, PIPE_SOUTH, PIPE_WEST, PIPE_EAST)
+        builder.add(PIPE_DOWN, PIPE_UP, PIPE_NORTH, PIPE_SOUTH, PIPE_WEST, PIPE_EAST, WATERLOGGED)
     }
 
     override fun getStateForPlacement(ctx: BlockPlaceContext): BlockState =
         rebuildState(ctx.level, ctx.clickedPos, defaultBlockState())
+            .setValue(WATERLOGGED, ctx.placedInWater())
 
     override fun updateShape(
         state: BlockState,
@@ -276,7 +284,17 @@ open class NodeBlock(properties: Properties) : BaseEntityBlock(properties) {
         neighborPos: BlockPos,
         neighborState: BlockState,
         random: RandomSource,
-    ): BlockState = rebuildState(level, pos, state)
+    ): BlockState {
+        if (state.getValue(WATERLOGGED)) {
+            ticks.scheduleTick(pos, Fluids.WATER, Fluids.WATER.getTickDelay(level))
+        }
+        // A neighbour changed, so the renderer's cached beams may be stale.
+        (level.getBlockEntity(pos) as? NodeBlockEntity)?.invalidateRenderCache()
+        return rebuildState(level, pos, state)
+    }
+
+    override fun getFluidState(state: BlockState): FluidState =
+        waterloggedFluid(state) ?: super.getFluidState(state)
 
     override fun getShape(
         state: BlockState,

@@ -69,7 +69,8 @@ class ProcessingStorageBlockEntity(
             val timeout = ProcessingSet.getTimeout(stack)
             val serial = ProcessingSet.isSerial(stack)
             val fuzzy = ProcessingSet.isFuzzy(stack)
-            if (outputs.isEmpty()) continue
+            // A set with no guaranteed output can't be counted on, so it isn't a recipe.
+            if (outputs.none { !it.optional }) continue
             val name = ProcessingSet.computeRecipeId(stack, registries)
             result.add(ProcessingApiInfo(name, inputs, outputs, timeout, serial, fuzzy))
         }
@@ -133,9 +134,10 @@ class ProcessingStorageBlockEntity(
         private val inputsPairsOverride: List<Pair<String, Int>>? = null,
         private val outputsPairsOverride: List<Pair<String, Int>>? = null,
     ) {
-        /** All output item IDs. Strips components, used by consumers that just
-         *  need to know which items the recipe can produce by name. */
-        val outputItemIds: List<String> get() = outputsAsPairs.map { it.first }
+        /** Item IDs the recipe can be counted on to produce. Strips components and
+         *  leaves out optional outputs, so the planner never plans a craft on a chance drop. */
+        val outputItemIds: List<String>
+            get() = outputsPairsOverride?.map { it.first } ?: outputs.filter { !it.optional }.map { it.itemId }
 
         /** Legacy `(itemId, count)` projection for consumers that haven't
          *  been widened to component-aware reads yet. Components are dropped. */
@@ -143,6 +145,12 @@ class ProcessingStorageBlockEntity(
             get() = inputsPairsOverride ?: inputs.map { it.itemId to it.count }
         val outputsAsPairs: List<Pair<String, Int>>
             get() = outputsPairsOverride ?: outputs.map { it.itemId to it.count }
+
+        /** What each input's Lua parameter is named from. A tag input of a set with
+         *  substitutions on is named from its tag, since sets built from the same tag
+         *  recipe share a handler whatever example item each one shows. */
+        val handlerParamSource: List<Pair<String, Int>>
+            get() = inputsPairsOverride ?: inputs.map { (if (fuzzy && it.tag != null) it.tag else it.itemId) to it.count }
 
         companion object {
             /** Test/legacy fixture: build a [ProcessingApiInfo] from
@@ -219,11 +227,13 @@ class ProcessingStorageBlockEntity(
             // Deferring via the revalidation queue (instead of propagating now)
             // avoids traversing this about-to-be-removed position as a cluster
             // neighbor.
-            for (dir in Direction.entries) {
-                val neighbor = worldPosition.relative(dir)
-                if (lvl.isLoaded(neighbor) && lvl.getBlockEntity(neighbor) is ProcessingStorageBlockEntity) {
-                    NodeConnectionHelper.queueRevalidation(lvl, neighbor)
-                }
+            // A broken member may have cut the cluster, so each sibling's walk must still
+            // reach every other to keep an id from before. An unload names nothing.
+            val siblings = Direction.entries.map { worldPosition.relative(it) }
+                .filter { lvl.isLoaded(it) && lvl.getBlockEntity(it) is ProcessingStorageBlockEntity }
+            val joined = if (blockDestroyed) siblings else emptyList()
+            for (neighbor in siblings) {
+                NodeConnectionHelper.queueRevalidation(lvl, neighbor, joined)
             }
         }
         super.setRemoved()
@@ -286,7 +296,7 @@ class ProcessingStorageBlockEntity(
         networkId = input.getStringOrNull("networkId")?.takeIf { it.isNotEmpty() }?.let {
             try { UUID.fromString(it) } catch (_: Exception) { null }
         }
-        damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
+        if (level != null) damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(worldPosition)
         connections.clear()
         connections.addAll(input.getBlockPosList("connections"))
     }

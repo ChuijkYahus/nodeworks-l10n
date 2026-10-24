@@ -74,12 +74,17 @@ class DiagnosticScreen(
             "import_chest" to 0xFFB8915C.toInt(),
             "export_chest" to 0xFFB8915C.toInt(),
             "processing_handler" to 0xFFDD55DD.toInt(),
+            "multi_processing_handler" to 0xFFDD55DD.toInt(),
+            "craft_requester" to 0xFFFFAA55.toInt(),
+            "storage_meter" to 0xFF9DC88D.toInt(),
+            "monitor" to 0xFFAE8FE0.toInt(),
         )
 
         private val CARD_COLORS = mapOf(
             "io" to 0xFF83E086.toInt(),
             "storage" to 0xFFAA83E0.toInt(),
-            "redstone" to 0xFFF53B68.toInt()
+            "redstone" to 0xFFF53B68.toInt(),
+            "transfer" to 0xFF4FA3FF.toInt()
         )
 
         private val BLOCK_LABELS = mapOf(
@@ -101,9 +106,22 @@ class DiagnosticScreen(
             "import_chest" to "Import Chest",
             "export_chest" to "Export Chest",
             "processing_handler" to "Processing Handler",
+            "multi_processing_handler" to "Multi-Processing Handler",
+            "craft_requester" to "Craft Requester",
+            "storage_meter" to "Storage Meter",
+            "monitor" to "Monitor",
         )
 
-        private val TAB_NAMES = listOf("Topology", "Route", "Craft", "Jobs")
+        /** How often the inspector rows are rebuilt while a block stays selected. */
+        private const val INSPECTOR_ROWS_REFRESH_MS = 250L
+
+        private const val TAB_TOPOLOGY = 0
+        private const val TAB_CRAFT = 1
+        private const val TAB_JOBS = 2
+        private val TAB_NAMES = listOf("Topology", "Craft", "Jobs")
+
+        private val ICONS_TEXTURE: net.minecraft.resources.Identifier =
+            net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "textures/gui/icons.png")
 
         private val BLOCK_ITEMS: Map<String, ItemStack> by lazy {
             val reg = damien.nodeworks.registry.ModBlocks
@@ -126,11 +144,15 @@ class DiagnosticScreen(
                 "import_chest" to ItemStack(reg.IMPORT_CHEST),
                 "export_chest" to ItemStack(reg.EXPORT_CHEST),
                 "processing_handler" to ItemStack(reg.PROCESSING_HANDLER),
+                "multi_processing_handler" to ItemStack(reg.MULTI_PROCESSING_HANDLER),
+                "craft_requester" to ItemStack(reg.CRAFT_REQUESTER),
+                "storage_meter" to ItemStack(reg.STORAGE_METER),
+                "monitor" to ItemStack(reg.MONITOR),
             )
         }
     }
 
-    private var activeTab = 0
+    private var activeTab = TAB_TOPOLOGY
 
     // Topology view state
     private var panX = 0f
@@ -173,6 +195,17 @@ class DiagnosticScreen(
     /** Map from BlockPos to its group index (only for stacked blocks). */
     private val blockToGroup = mutableMapOf<BlockPos, Int>()
 
+    /** One connection to draw, in rotated world space from its owner to its target, with
+     *  every waypoint that only continues a straight run dropped. A pipe run sends one
+     *  waypoint per pipe, and a hundred pipes in a line draw as one segment. */
+    private class EdgePath(val xs: FloatArray, val zs: FloatArray)
+
+    private val edgePaths = ArrayList<EdgePath>()
+
+    /** Per-block card types and error flag, worked out with the layout instead of every frame. */
+    private val cardTypesByBlock = HashMap<BlockPos, List<String>>()
+    private val erroredBlocks = HashSet<BlockPos>()
+
     /** Snapshot of [menu.blocks.size] last time the layout was rebuilt.
      *  Triggers a rebuild when topology chunks have grown the list since the
      *  last frame, otherwise the rotated positions / stack groups stay frozen
@@ -193,6 +226,9 @@ class DiagnosticScreen(
         rotatedPositions.clear()
         stackGroups.clear()
         blockToGroup.clear()
+        edgePaths.clear()
+        cardTypesByBlock.clear()
+        erroredBlocks.clear()
 
         val player = net.minecraft.client.Minecraft.getInstance().player
         val playerX = player?.x?.toFloat() ?: 0f
@@ -228,6 +264,20 @@ class DiagnosticScreen(
             }
         }
 
+        val posSet = blocks.mapTo(HashSet()) { it.pos }
+        for (block in blocks) {
+            for (path in block.connections) {
+                if (path.isEmpty()) continue
+                val target = path.last()
+                if (target !in posSet) continue
+                // Either end could own the edge, the lower position draws it.
+                if (block.pos.asLong() > target.asLong()) continue
+                edgePaths.add(simplifiedPath(block.pos, path))
+            }
+            if (block.cards.isNotEmpty()) cardTypesByBlock[block.pos] = block.cards.map { it.cardType }.distinct()
+            if (block.details.any { it.startsWith("__error:") }) erroredBlocks.add(block.pos)
+        }
+
         val byXZ = blocks.groupBy {
             val p = rotatedPositions[it.pos]!!
             (p.first * 10).roundToInt() to (p.second * 10).roundToInt()
@@ -242,6 +292,38 @@ class DiagnosticScreen(
                 }
             }
         }
+    }
+
+    /** The polyline from [start] through [path], in rotated world space. The view drops
+     *  height, so a step straight up or down lands on the same spot and goes, and a point
+     *  that only carries on in the direction already heading goes too. */
+    private fun simplifiedPath(start: BlockPos, path: List<BlockPos>): EdgePath {
+        val pts = ArrayList<BlockPos>(minOf(path.size + 1, 16))
+        pts.add(start)
+        for (p in path) {
+            val last = pts.last()
+            if (p.x == last.x && p.z == last.z) continue
+            if (pts.size >= 2) {
+                val a = pts[pts.size - 2]
+                val ax = (last.x - a.x).toLong()
+                val az = (last.z - a.z).toLong()
+                val bx = (p.x - last.x).toLong()
+                val bz = (p.z - last.z).toLong()
+                if (ax * bz - az * bx == 0L && ax * bx + az * bz > 0L) {
+                    pts[pts.size - 1] = p
+                    continue
+                }
+            }
+            pts.add(p)
+        }
+        val xs = FloatArray(pts.size)
+        val zs = FloatArray(pts.size)
+        for ((i, p) in pts.withIndex()) {
+            val r = rotatedPositions[p]
+            xs[i] = r?.first ?: 0f
+            zs[i] = r?.second ?: 0f
+        }
+        return EdgePath(xs, zs)
     }
 
     override fun init() {
@@ -266,7 +348,7 @@ class DiagnosticScreen(
             it.setMaxLength(128)
             it.setBordered(true)
             it.setHint(net.minecraft.network.chat.Component.literal("insert item id"))
-            it.visible = activeTab == 2
+            it.visible = activeTab == TAB_CRAFT
             it.setResponder { value -> updateCraftAutocomplete(value) }
             addRenderableWidget(it)
         }
@@ -363,9 +445,9 @@ class DiagnosticScreen(
         NineSlice.PANEL_INSET.draw(graphics, contentLeft, contentTop, contentW, contentH)
 
         when (activeTab) {
-            0 -> renderTopology(graphics, mouseX, mouseY)
-            2 -> renderCraftPreview(graphics, mouseX, mouseY)
-            3 -> renderJobsAndErrors(graphics, mouseX, mouseY)
+            TAB_TOPOLOGY -> renderTopology(graphics, mouseX, mouseY)
+            TAB_CRAFT -> renderCraftPreview(graphics, mouseX, mouseY)
+            TAB_JOBS -> renderJobsAndErrors(graphics, mouseX, mouseY)
             else -> {
                 val msg = "Coming Soon"
                 val msgW = font.width(msg)
@@ -376,7 +458,7 @@ class DiagnosticScreen(
         // Inspector panel, rendered last with higher Z to draw over topology blocks.
         // 26.1: `flush()` is gone, `nextStratum()` is the replacement, it advances
         // the Z stratum so later draws layer above what came before in this extract.
-        if (activeTab == 0) {
+        if (activeTab == TAB_TOPOLOGY) {
             graphics.nextStratum()
             graphics.pose().pushMatrix()
             renderInspector(graphics, mouseX, mouseY)
@@ -399,40 +481,27 @@ class DiagnosticScreen(
 
         graphics.enableScissor(contentLeft, contentTop, contentLeft + contentW, contentTop + contentH)
 
-        val posSet = blocks.map { it.pos }.toSet()
+        // What is on screen, with room for an icon, its card pill and its badges, so a
+        // network of thousands only draws the part in view.
+        val margin = 24
+        val viewL = contentLeft - margin
+        val viewT = contentTop - margin
+        val viewR = contentLeft + contentW + margin
+        val viewB = contentTop + contentH + margin
 
-        // Draw connections as polylines along their actual pipe path. Each
-        // logical neighbour ships with a waypoint list, intermediate entries
-        // are pipe positions and the last entry is the non-pipe target. Drawing
-        // segment-by-segment keeps the line aligned with the world layout
-        // instead of cutting a diagonal between the two endpoints.
-        for (block in blocks) {
-            val sx1 = blockScreenX(block.pos)
-            val sy1 = blockScreenY(block.pos)
-            for (path in block.connections) {
-                if (path.isEmpty()) continue
-                val target = path.last()
-                if (target !in posSet) continue
-                // Dedup symmetric edges. Either direction owns the draw based
-                // on pos ordering of the two non-pipe endpoints, intermediates
-                // don't affect the decision.
-                if (block.pos.asLong() > target.asLong()) continue
-                var px = sx1
-                var py = sy1
-                for (wp in path) {
-                    val nx = blockScreenX(wp)
-                    val ny = blockScreenY(wp)
-                    drawLine(
-                        graphics,
-                        px.roundToInt(),
-                        py.roundToInt(),
-                        nx.roundToInt(),
-                        ny.roundToInt(),
-                        networkLineColor
-                    )
-                    px = nx
-                    py = ny
-                }
+        // Connections along their pipe paths, one segment per straight run, see [EdgePath].
+        for (edge in edgePaths) {
+            var px = worldToScreenX(edge.xs[0])
+            var py = worldToScreenY(edge.zs[0])
+            for (i in 1 until edge.xs.size) {
+                val nx = worldToScreenX(edge.xs[i])
+                val ny = worldToScreenY(edge.zs[i])
+                // Off one side of the view entirely, nothing of it shows.
+                val off = (px < viewL && nx < viewL) || (px > viewR && nx > viewR) ||
+                    (py < viewT && ny < viewT) || (py > viewB && ny > viewB)
+                if (!off) drawLine(graphics, px, py, nx, ny, networkLineColor)
+                px = nx
+                py = ny
             }
         }
 
@@ -445,6 +514,7 @@ class DiagnosticScreen(
 
             val sx = blockScreenX(block.pos).roundToInt()
             val sy = blockScreenY(block.pos).roundToInt()
+            if (sx < viewL || sx > viewR || sy < viewT || sy > viewB) continue
             renderBlockIcon(graphics, block, sx, sy, halfBlock, mouseX, mouseY)
         }
 
@@ -492,6 +562,7 @@ class DiagnosticScreen(
                 // Collapsed: render stacked item icons with slight offset + count badge
                 val sx = worldToScreenX(group.displayPos.first).roundToInt()
                 val sy = worldToScreenY(group.displayPos.second).roundToInt()
+                if (sx < viewL || sx > viewR || sy < viewT || sy > viewB) continue
                 val stackOffset = 3 // pixel offset per stacked icon
                 val totalStackOffset = (group.blocks.size - 1) * stackOffset
 
@@ -1259,13 +1330,15 @@ class DiagnosticScreen(
     private val lineH get() = font.lineHeight + 1
 
     /** Inspector row types for the floating inspector panel. */
-    private enum class RowType { H2, PROPERTY, HANDLER }
+    private enum class RowType { H2, PROPERTY, HANDLER, RECIPE }
     private data class InspectorRow(
         val type: RowType,
         val text: String,
         val color: Int = WHITE,
         val iconU: Int = -1,
-        val blockItemId: String = ""
+        val blockItemId: String = "",
+        /** For [RowType.RECIPE], the grid to draw: inputs by slot, outputs in a column. */
+        val recipe: ProcessingHandlerOpenData.AvailableSet? = null,
     )
 
     private val CARD_ICON_U = mapOf("io" to 0, "storage" to 16, "redstone" to 32)
@@ -1311,6 +1384,11 @@ class DiagnosticScreen(
             }
         }
 
+        // Recipes drawn as grids, from the client copy of a storage block, which syncs its
+        // cards, or from the streamed Processing Sets for a handler. Out of client range
+        // the server's text list below stands in.
+        val recipeRows = recipeRowsFor(block)
+
         // Details, pull out the __error: prefix into its own dedicated section
         // at the top so it's the first thing the player sees.
         val errorDetail = block.details.firstOrNull { it.startsWith("__error:") }
@@ -1318,7 +1396,11 @@ class DiagnosticScreen(
             rows.add(InspectorRow(RowType.H2, "Error"))
             rows.add(InspectorRow(RowType.PROPERTY, errorDetail.removePrefix("__error:"), 0xFFFF8888.toInt()))
         }
-        val visibleDetails = block.details.filter { !it.startsWith("__error:") }
+        // The server's indented per-recipe names are the stand-in for the grids, and the
+        // handler's set markers only feed them.
+        val visibleDetails = block.details.filter {
+            !it.startsWith("__error:") && !it.startsWith("__mset:") && !(recipeRows != null && it.startsWith("  "))
+        }
         // Variable live value, appended to Details (not a separate section) and read
         // from the client-side BE every frame. buildInspectorRows runs per render tick
         // and the client BE stays synced via standard chunk BE sync, so the value
@@ -1338,18 +1420,124 @@ class DiagnosticScreen(
             }
         }
 
+        if (recipeRows != null && recipeRows.isNotEmpty()) {
+            rows.add(InspectorRow(RowType.H2, "Recipes"))
+            rows.addAll(recipeRows)
+        }
+
         return rows
+    }
+
+    /** Grid rows for a storage block, built from the client copy of the block entity so
+     *  the open packet carries no stacks. Null when the block is not loaded on the client,
+     *  the server's text list then stands in. Each recipe is a name row and a grid row,
+     *  a Processing Set whose name is only a hash gets the grid alone. */
+    private fun recipeRowsFor(block: DiagnosticOpenData.NetworkBlock): List<InspectorRow>? {
+        val lvl = net.minecraft.client.Minecraft.getInstance().level ?: return null
+        when (block.type) {
+            "instruction_storage" -> {
+                val be = lvl.getBlockEntity(block.pos) as? damien.nodeworks.block.entity.InstructionStorageBlockEntity ?: return null
+                val out = ArrayList<InspectorRow>()
+                for (i in 0 until damien.nodeworks.block.entity.InstructionStorageBlockEntity.TOTAL_SLOTS) {
+                    val card = be.getItem(i)
+                    if (card.isEmpty || card.item !is damien.nodeworks.card.InstructionSet) continue
+                    val inputs = damien.nodeworks.card.InstructionSet.getRecipeStacks(card)
+                        .map { damien.nodeworks.script.RecipeIngredient(it, 1) }
+                    val output = damien.nodeworks.card.InstructionSet.getOutputStack(card)
+                    val outputs = if (output.isEmpty) emptyList()
+                        else listOf(damien.nodeworks.script.RecipeIngredient(output, damien.nodeworks.card.InstructionSet.getOutputCount(card)))
+                    val outputId = damien.nodeworks.card.InstructionSet.getOutput(card)
+                    val name = card.hoverName.string.takeIf { it != "Instruction Set" }
+                        ?: outputId.substringAfter(':').ifEmpty { "(empty)" }
+                    out.add(InspectorRow(RowType.PROPERTY, name, WHITE))
+                    out.add(InspectorRow(RowType.RECIPE, name, recipe = ProcessingHandlerOpenData.AvailableSet(name, inputs, outputs)))
+                }
+                return out
+            }
+            "multi_processing_handler" -> {
+                val out = ArrayList<InspectorRow>()
+                for (detail in block.details) {
+                    if (!detail.startsWith("__mset:")) continue
+                    val name = detail.removePrefix("__mset:")
+                    val api = menu.processingApis.firstOrNull { it.name == name }
+                    if (api == null) {
+                        // Not streamed yet, or the set left the network.
+                        out.add(InspectorRow(RowType.PROPERTY, name, GRAY))
+                        continue
+                    }
+                    if (!name.startsWith("recipe_")) out.add(InspectorRow(RowType.PROPERTY, name, WHITE))
+                    out.add(InspectorRow(RowType.RECIPE, name, recipe = ProcessingHandlerOpenData.AvailableSet(name, api.inputs, api.outputs)))
+                }
+                return out
+            }
+            "processing_storage" -> {
+                val be = lvl.getBlockEntity(block.pos) as? damien.nodeworks.block.entity.ProcessingStorageBlockEntity ?: return null
+                val out = ArrayList<InspectorRow>()
+                for (api in be.getProcessingApis()) {
+                    if (!api.name.startsWith("recipe_")) out.add(InspectorRow(RowType.PROPERTY, api.name, WHITE))
+                    out.add(InspectorRow(RowType.RECIPE, api.name, recipe = ProcessingHandlerOpenData.AvailableSet(api.name, api.inputs, api.outputs)))
+                }
+                return out
+            }
+            else -> return null
+        }
+    }
+
+    /** The row whose text is scrolling under the mouse, and when the hover began. */
+    private var marqueeKey: String? = null
+    private var marqueeStart = 0L
+
+    /** How far left to draw a hovered row's text so its cut-off end comes into view:
+     *  a short hold, a slow scroll to the end, a hold there, then round again. Zero for
+     *  text that fits or a row not hovered. */
+    private fun marqueeShift(key: String, hovered: Boolean, overflow: Int): Int {
+        if (!hovered || overflow <= 0) {
+            if (marqueeKey == key) marqueeKey = null
+            return 0
+        }
+        val now = net.minecraft.util.Util.getMillis()
+        if (marqueeKey != key) {
+            marqueeKey = key
+            marqueeStart = now
+        }
+        val hold = 700L
+        val travel = overflow * 25L
+        val phase = (now - marqueeStart) % (hold + travel + hold)
+        return when {
+            phase < hold -> 0
+            phase < hold + travel -> ((phase - hold) * overflow / travel).toInt()
+            else -> overflow
+        }
+    }
+
+    /** The rows for the selected block. Building them parses the block's cards and lays
+     *  out recipe grids, and the bounds, the body height and the render each ask for them,
+     *  so they are built once per selection and refreshed a few times a second for live
+     *  values such as a Variable's, not three times a frame. */
+    private var inspectorRowsCache: List<InspectorRow> = emptyList()
+    private var inspectorRowsPos: BlockPos? = null
+    private var inspectorRowsAt = 0L
+
+    private fun inspectorRows(block: DiagnosticOpenData.NetworkBlock): List<InspectorRow> {
+        val now = net.minecraft.util.Util.getMillis()
+        if (inspectorRowsPos != block.pos || now - inspectorRowsAt >= INSPECTOR_ROWS_REFRESH_MS) {
+            inspectorRowsCache = buildInspectorRows(block)
+            inspectorRowsPos = block.pos
+            inspectorRowsAt = now
+        }
+        return inspectorRowsCache
     }
 
     private fun getInspectorTotalBodyH(): Int {
         val sel = selectedBlock ?: return 0
-        val rows = buildInspectorRows(sel)
+        val rows = inspectorRows(sel)
         var bodyH = 4
         for (row in rows) {
             bodyH += when (row.type) {
                 RowType.H2 -> lineH + 3
                 RowType.PROPERTY -> lineH
                 RowType.HANDLER -> damien.nodeworks.screen.widget.RecipeHintRenderer.HINT_HEIGHT + 1
+                RowType.RECIPE -> damien.nodeworks.screen.widget.RecipeGridRenderer.HORIZONTAL_H + 4
             }
         }
         bodyH += 4
@@ -1403,7 +1591,7 @@ class DiagnosticScreen(
         graphics.drawString(font, "x", closeX + 1, closeY, if (closeHovered) WHITE else GRAY, false)
 
         // Body rows (scrollable)
-        val rows = buildInspectorRows(sel)
+        val rows = inspectorRows(sel)
         val bodyTop = py + 20
         val bodyBottom = py + ph
         val bodyH = bodyBottom - bodyTop
@@ -1417,6 +1605,10 @@ class DiagnosticScreen(
         var rowIndex = 0
 
         var isFirstRow = true
+        var absRow = 0
+        val textRight = px + pw - scrollbarW - 4
+        val mouseInBody = mouseX >= px + 3 && mouseX < textRight && mouseY >= bodyTop && mouseY < bodyBottom
+        var hoverStack: ItemStack? = null
         for (row in rows) {
             when (row.type) {
                 RowType.H2 -> {
@@ -1472,14 +1664,18 @@ class DiagnosticScreen(
                         graphics.fill(swatchX, textY, swatchX + ss, textY + ss, swatchColor)
                         val hexStr = "#${Integer.toHexString(colorVal).uppercase().padStart(6, '0')}"
                         graphics.drawString(font, hexStr, swatchX + ss + 3, textY, DIM, false)
-                    } else if (row.text.startsWith("__channel:")) {
+                    } else if (row.text.startsWith("__channel:") || row.text.startsWith("__channelL:")) {
                         // Format: __channel:<rgbInt>:<name>, or __channel:ALL for the
                         // unrestricted "any channel" case. Mirrors the dye-swatch the
                         // Channel Picker widget uses so the diagnostic reads visually
                         // identical to the device's own GUI.
-                        graphics.drawString(font, "Channel:", textX, textY, 0xFFCCCCCC.toInt(), false)
-                        val labelW = font.width("Channel: ")
-                        val payload = row.text.removePrefix("__channel:")
+                        // __channelL:<Label>|<payload> names the row, as "Inputs" and
+                        // "Outputs" on a Multi-Processing Handler, else it reads "Channel".
+                        val labelled = row.text.startsWith("__channelL:")
+                        val label = if (labelled) row.text.removePrefix("__channelL:").substringBefore('|') + ":" else "Channel:"
+                        graphics.drawString(font, label, textX, textY, 0xFFCCCCCC.toInt(), false)
+                        val labelW = font.width("$label ")
+                        val payload = if (labelled) row.text.removePrefix("__channelL:").substringAfter('|') else row.text.removePrefix("__channel:")
                         val ss = font.lineHeight - 2
                         val swatchX = textX + labelW
                         graphics.fill(swatchX - 1, textY - 1, swatchX + ss + 1, textY + ss + 1, 0xFF444444.toInt())
@@ -1536,6 +1732,29 @@ class DiagnosticScreen(
                         graphics.fill(x - 1, textY - 1, x + ss + 1, textY + ss + 1, 0xFF444444.toInt())
                         Icons.WHITE_WOOL.drawTinted(graphics, x, textY, ss, rgb)
                         graphics.drawString(font, name, x + ss + 3, textY, DIM, false)
+                    } else if (row.text.startsWith("__rule:")) {
+                        // A filter rule with an example of what it matches: the item, the
+                        // item with its components, or one member at a time of a tag, regex
+                        // or namespace rule.
+                        val rule = row.text.removePrefix("__rule:")
+                        val registries = net.minecraft.client.Minecraft.getInstance().level?.registryAccess()
+                        val example = if (registries != null) damien.nodeworks.screen.widget.FilterRuleIcons.exampleStack(rule, registries) else ItemStack.EMPTY
+                        var x = textX
+                        if (!example.isEmpty) {
+                            graphics.pose().pushMatrix()
+                            graphics.pose().translate(x.toFloat(), (textY - 1).toFloat())
+                            graphics.pose().scale(0.5f, 0.5f)
+                            graphics.renderItem(example, 0, 0)
+                            graphics.pose().popMatrix()
+                            if (mouseInBody && mouseY >= curY && mouseY < curY + lineH && mouseX >= x && mouseX < x + 8) hoverStack = example
+                        }
+                        x += 10
+                        val overflow = font.width(rule) - (textRight - x)
+                        val hovered = mouseInBody && mouseY >= curY && mouseY < curY + lineH
+                        val shift = marqueeShift("$absRow:${row.text}", hovered, overflow)
+                        if (overflow > 0) graphics.enableScissor(x, curY, textRight, curY + lineH)
+                        graphics.drawString(font, rule, x - shift, textY, DIM, false)
+                        if (overflow > 0) graphics.disableScissor()
                     } else if (row.text.startsWith("__alias:")) {
                         // Format: __alias:<rgbInt>:<text>. Renders "Name:" in the
                         // standard key gray, value text in the device's sidebar tint
@@ -1564,16 +1783,24 @@ class DiagnosticScreen(
                             glowColor and 0xFFFFFF
                         )
                     } else {
+                        // Text wider than the row scrolls into view while the mouse rests
+                        // on it, clipped to the row so it never runs under the scrollbar.
+                        val overflow = font.width(row.text) - (textRight - textX)
+                        val hovered = mouseInBody && mouseY >= curY && mouseY < curY + lineH
+                        val shift = marqueeShift("$absRow:${row.text}", hovered, overflow)
+                        if (overflow > 0) graphics.enableScissor(textX, curY, textRight, curY + lineH)
+                        val drawX = textX - shift
                         // Key: value color split
                         val colonIdx = row.text.indexOf(':')
                         if (colonIdx > 0) {
                             val key = row.text.substring(0, colonIdx + 1)
                             val value = row.text.substring(colonIdx + 1)
-                            graphics.drawString(font, key, textX, textY, 0xFFCCCCCC.toInt(), false)
-                            graphics.drawString(font, value, textX + font.width(key), textY, DIM, false)
+                            graphics.drawString(font, key, drawX, textY, 0xFFCCCCCC.toInt(), false)
+                            graphics.drawString(font, value, drawX + font.width(key), textY, DIM, false)
                         } else {
-                            graphics.drawString(font, row.text, textX, textY, row.color, false)
+                            graphics.drawString(font, row.text, drawX, textY, row.color, false)
                         }
+                        if (overflow > 0) graphics.disableScissor()
                     }
 
                     curY += lineH
@@ -1586,18 +1813,53 @@ class DiagnosticScreen(
                     // minus the scrollbar gutter (6px track + 2px pad on each side).
                     val stripX = px + 6
                     val stripW = pw - 12
-                    damien.nodeworks.screen.widget.RecipeHintRenderer.renderById(
-                        graphics, font, row.text, stripX, curY,
-                        stripW, damien.nodeworks.screen.widget.RecipeHintRenderer.HINT_HEIGHT,
+                    // A `network:recipes` rule has a label, not a recipe id, and lists as text.
+                    damien.nodeworks.screen.widget.RecipeHintRenderer.renderHandlers(
+                        graphics, font, listOf(row.text), stripX, curY, stripW, rowGap = 0,
                         resolver = { hash -> menu.processingApis.firstOrNull { it.name == hash } }
                     )
                     curY += damien.nodeworks.screen.widget.RecipeHintRenderer.HINT_HEIGHT + 1
                     rowIndex++
                 }
+
+                RowType.RECIPE -> {
+                    // Inputs as the 3x3 grid, outputs in the column, the same picture the
+                    // Processing Set and handler GUIs draw. Centred in the body width.
+                    val gridTop = curY + 2
+                    val gridW = pw - 12
+                    damien.nodeworks.screen.widget.RecipeGridRenderer.drawHorizontal(
+                        graphics, font, px + 6, gridTop, gridW, damien.nodeworks.screen.widget.RecipeGridRenderer.HORIZONTAL_H, row.recipe,
+                    )
+                    // Slot under the mouse, laid out as drawHorizontal centres it.
+                    val recipe = row.recipe
+                    if (recipe != null && mouseInBody && mouseY >= maxOf(gridTop, bodyTop) &&
+                        mouseY < minOf(gridTop + damien.nodeworks.screen.widget.RecipeGridRenderer.HORIZONTAL_H, bodyBottom)
+                    ) {
+                        val slot = damien.nodeworks.screen.widget.RecipeGridRenderer.SLOT_SIZE
+                        val gridX = px + 6 + (gridW - damien.nodeworks.screen.widget.RecipeGridRenderer.HORIZONTAL_W) / 2
+                        val outputX = gridX + damien.nodeworks.screen.widget.RecipeGridRenderer.GRID_W + damien.nodeworks.screen.widget.RecipeGridRenderer.ARROW_SPAN
+                        val row3 = (mouseY - gridTop) / slot
+                        if (mouseX >= gridX && mouseX < gridX + damien.nodeworks.screen.widget.RecipeGridRenderer.GRID_W) {
+                            val col = (mouseX - gridX) / slot
+                            recipe.inputs.getOrNull(row3 * 3 + col)?.let { ingr ->
+                                val shown = damien.nodeworks.screen.widget.RecipeGridRenderer.shownStack(ingr)
+                                if (!shown.isEmpty) hoverStack = shown
+                            }
+                        } else if (mouseX >= outputX && mouseX < outputX + slot) {
+                            recipe.outputs.getOrNull(row3)?.let { ingr -> if (!ingr.stack.isEmpty) hoverStack = ingr.stack }
+                        }
+                    }
+                    curY += damien.nodeworks.screen.widget.RecipeGridRenderer.HORIZONTAL_H + 4
+                    rowIndex++
+                }
             }
             isFirstRow = false
+            absRow++
         }
         graphics.disableScissor()
+        hoverStack?.let { stack ->
+            graphics.setTooltipForNextFrame(font, getTooltipFromItem(net.minecraft.client.Minecraft.getInstance(), stack), java.util.Optional.empty(), mouseX, mouseY)
+        }
 
         // Scrollbar
         if (totalBodyH > bodyH) {
@@ -1657,10 +1919,8 @@ class DiagnosticScreen(
         }
 
         // Card icons in a visible pill below the block
-        if (block.cards.isNotEmpty()) {
-            val iconsTexture =
-                net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "textures/gui/icons.png")
-            val uniqueTypes = block.cards.map { it.cardType }.distinct()
+        val uniqueTypes = cardTypesByBlock[block.pos]
+        if (uniqueTypes != null) {
             val iconSize = 12
             val iconSpacing = 0
             val pillW = uniqueTypes.size * (iconSize + iconSpacing) - iconSpacing
@@ -1677,7 +1937,7 @@ class DiagnosticScreen(
                 val iconY = pillY
                 // Render the full 16x16 atlas tile scaled down to iconSize
                 graphics.blit(
-                    iconsTexture, iconX, iconY, iconSize, iconSize,
+                    ICONS_TEXTURE, iconX, iconY, iconSize, iconSize,
                     iconU.toFloat(), 16f, 16, 16, 256, 256
                 )
             }
@@ -1685,18 +1945,16 @@ class DiagnosticScreen(
 
         // Pinned indicator icon (top-left corner of block)
         if (damien.nodeworks.render.NodeConnectionRenderer.pinnedBlock == block.pos) {
-            val pinIconTex =
-                net.minecraft.resources.Identifier.fromNamespaceAndPath("nodeworks", "textures/gui/icons.png")
             // 26.1: `RenderSystem.setShaderColor` is gone, tint goes via the per-call
             //  ARGB arg on the stretched-blit overload. 0xFF54CCFF = rgb(0.33, 0.8, 1.0).
-            graphics.blit(pinIconTex, sx - 11, sy - 11, 6, 6, 80f, 0f, 16, 16, 256, 256, 0xFF54CCFF.toInt())
+            graphics.blit(ICONS_TEXTURE, sx - 11, sy - 11, 6, 6, 80f, 0f, 16, 16, 256, 256, 0xFF54CCFF.toInt())
         }
 
         // Warning indicator (top-right corner of block) when the block has an
         // undismissed error, currently only Crafting Cores emit this via the
         // "__error:" detail prefix. renderItem draws at a higher Z than normal
         // blits, so we translate the pose up to sit on top of the block icon.
-        if (block.details.any { it.startsWith("__error:") }) {
+        if (block.pos in erroredBlocks) {
             graphics.pose().pushMatrix()
             graphics.pose().translate((0f).toFloat(), (0f).toFloat())
             Icons.WARNING.draw(graphics, sx + 3, sy - 11, 10)
@@ -1711,20 +1969,20 @@ class DiagnosticScreen(
         }
     }
 
-    private fun drawLine(graphics: GuiGraphicsExtractor, x1: Int, y1: Int, x2: Int, y2: Int, color: Int) {
+    /** A one pixel line as a single quad, turned to the segment's angle. Drawing it a pixel
+     *  at a time cost one quad per pixel, which at high zoom on a large network meant
+     *  hundreds of thousands of quads a frame. */
+    private fun drawLine(graphics: GuiGraphicsExtractor, x1: Float, y1: Float, x2: Float, y2: Float, color: Int) {
         val dx = x2 - x1
         val dy = y2 - y1
-        val steps = maxOf(kotlin.math.abs(dx), kotlin.math.abs(dy))
-        if (steps == 0) return
-        val xInc = dx.toFloat() / steps
-        val yInc = dy.toFloat() / steps
-        var x = x1.toFloat()
-        var y = y1.toFloat()
-        for (i in 0..steps) {
-            graphics.fill(x.roundToInt(), y.roundToInt(), x.roundToInt() + 1, y.roundToInt() + 1, color)
-            x += xInc
-            y += yInc
-        }
+        val length = kotlin.math.sqrt(dx * dx + dy * dy)
+        if (length < 0.5f) return
+        val pose = graphics.pose()
+        pose.pushMatrix()
+        pose.translate(x1, y1)
+        pose.rotate(kotlin.math.atan2(dy, dx))
+        graphics.fill(0, 0, kotlin.math.ceil(length).toInt(), 1, color)
+        pose.popMatrix()
     }
 
     // ========== Input ==========
@@ -1819,7 +2077,7 @@ class DiagnosticScreen(
 
         // Error click → switch to topology, select + pin the terminal, expand the
         // group if the terminal sits in one, and pan to center the view on it.
-        if (activeTab == 3 && errorClickRegions.isNotEmpty()) {
+        if (activeTab == TAB_JOBS && errorClickRegions.isNotEmpty()) {
             for ((yStart, yEnd, termPos) in errorClickRegions) {
                 if (my >= yStart && my < yEnd && mx >= contentLeft + contentW / 2 && mx < contentLeft + contentW) {
                     val block = menu.blocks.firstOrNull { it.pos == termPos }
@@ -1827,7 +2085,7 @@ class DiagnosticScreen(
                         selectedBlock = block
                         inspectorScrollY = 0
                         damien.nodeworks.render.NodeConnectionRenderer.pinnedBlock = termPos
-                        activeTab = 0
+                        activeTab = TAB_TOPOLOGY
                         craftItemField?.visible = false
                         blockToGroup[termPos]?.let { expandedGroups.add(it) }
                         centerViewOn(termPos)
@@ -1847,7 +2105,7 @@ class DiagnosticScreen(
                 tabX -= btnW + 2
                 if (mx >= tabX && mx < tabX + btnW) {
                     activeTab = i
-                    craftItemField?.visible = i == 2
+                    craftItemField?.visible = i == TAB_CRAFT
                     selectedBlock = null
                     // Clear hover state so a stale topology-tab tooltip doesn't bleed
                     // into the newly-opened tab.
@@ -1859,7 +2117,7 @@ class DiagnosticScreen(
         }
 
         // Group expand/collapse, click on stacked icons or expanded rectangle to toggle
-        if (activeTab == 0 && hoveredGroupIdx in stackGroups.indices) {
+        if (activeTab == TAB_TOPOLOGY && hoveredGroupIdx in stackGroups.indices) {
             val groupIdx = hoveredGroupIdx
             if (groupIdx in expandedGroups) expandedGroups.remove(groupIdx)
             else expandedGroups.add(groupIdx)
@@ -1867,7 +2125,7 @@ class DiagnosticScreen(
         }
 
         // Inspector panel interactions
-        if (activeTab == 0 && selectedBlock != null) {
+        if (activeTab == TAB_TOPOLOGY && selectedBlock != null) {
             val bounds = getInspectorBounds()
             if (bounds != null) {
                 val px = bounds[0];
@@ -1913,14 +2171,14 @@ class DiagnosticScreen(
         }
 
         // Click on a block to select/swap inspector
-        if (activeTab == 0 && hoveredBlock != null) {
+        if (activeTab == TAB_TOPOLOGY && hoveredBlock != null) {
             selectedBlock = hoveredBlock
             inspectorScrollY = 0
             return true
         }
 
         // Click in content area, start drag (don't deselect inspector)
-        if (activeTab == 0 && mx >= contentLeft && mx < contentLeft + contentW &&
+        if (activeTab == TAB_TOPOLOGY && mx >= contentLeft && mx < contentLeft + contentW &&
             my >= contentTop && my < contentTop + contentH
         ) {
             dragging = true
@@ -1934,7 +2192,7 @@ class DiagnosticScreen(
         //   treeAreaRight = graphRight        = contentLeft + contentW - 4
         //   treeAreaTop   = graphTop          = contentTop + 22
         //   treeAreaBottom= graphBottom       = contentTop + contentH - 4
-        if (activeTab == 2) {
+        if (activeTab == TAB_CRAFT) {
             val treeAreaLeft = contentLeft + 6 + 180
             val treeAreaRight = contentLeft + contentW - 4
             val treeAreaTop = contentTop + 22
@@ -2007,7 +2265,7 @@ class DiagnosticScreen(
         }
 
         // Inspector panel scroll
-        if (activeTab == 0 && selectedBlock != null) {
+        if (activeTab == TAB_TOPOLOGY && selectedBlock != null) {
             val bounds = getInspectorBounds()
             if (bounds != null) {
                 val ipx = bounds[0]; val ipy = bounds[1]; val ipw = bounds[2]; val iph = bounds[3]
@@ -2018,7 +2276,7 @@ class DiagnosticScreen(
             }
         }
 
-        if (activeTab == 0 && mouseX >= contentLeft && mouseX < contentLeft + contentW &&
+        if (activeTab == TAB_TOPOLOGY && mouseX >= contentLeft && mouseX < contentLeft + contentW &&
             mouseY >= contentTop && mouseY < contentTop + contentH
         ) {
             val oldZoom = zoom
@@ -2033,7 +2291,7 @@ class DiagnosticScreen(
             return true
         }
         // Craft tab: scroll text tree on left detail panel, zoom graph on the right.
-        if (activeTab == 2 && mouseY >= contentTop && mouseY < contentTop + contentH) {
+        if (activeTab == TAB_CRAFT && mouseY >= contentTop && mouseY < contentTop + contentH) {
             val treeAreaLeft = contentLeft + 6 + 180
             val treeAreaRight = contentLeft + contentW - 4
             val treeAreaTop = contentTop + 22
@@ -2063,7 +2321,7 @@ class DiagnosticScreen(
             }
         }
         // Jobs tab scrolling
-        if (activeTab == 3 && mouseX >= contentLeft && mouseX < contentLeft + contentW &&
+        if (activeTab == TAB_JOBS && mouseX >= contentLeft && mouseX < contentLeft + contentW &&
             mouseY >= contentTop && mouseY < contentTop + contentH
         ) {
             jobsScrollY = (jobsScrollY - scrollY.toInt() * 10).coerceAtLeast(0)

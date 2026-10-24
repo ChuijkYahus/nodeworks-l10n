@@ -14,6 +14,7 @@ import damien.nodeworks.block.BroadcastAntennaBlock
 import damien.nodeworks.block.ExportChestBlock
 import damien.nodeworks.block.ImportChestBlock
 import damien.nodeworks.block.PlacerBlock
+import damien.nodeworks.block.MultiProcessingHandlerBlock
 import damien.nodeworks.block.ProcessingHandlerBlock
 import damien.nodeworks.block.UserBlock
 import damien.nodeworks.block.CraftingCoreBlock
@@ -102,6 +103,7 @@ object ModBlocks {
         BlockBehaviour.Properties.of()
             .strength(2.0f, 4.0f)
             .requiresCorrectToolForDrops()
+            .noOcclusion()
     )
 
     val CRAFT_REQUESTER: Block = register(
@@ -110,6 +112,7 @@ object ModBlocks {
         BlockBehaviour.Properties.of()
             .strength(2.0f, 4.0f)
             .requiresCorrectToolForDrops()
+            .noOcclusion()
     )
 
     val INSTRUCTION_STORAGE: Block = register(
@@ -162,6 +165,7 @@ object ModBlocks {
         BlockBehaviour.Properties.of()
             .strength(3.0f, 6.0f)
             .requiresCorrectToolForDrops()
+            .noOcclusion()
     )
 
     val PLACER: Block = register(
@@ -170,6 +174,7 @@ object ModBlocks {
         BlockBehaviour.Properties.of()
             .strength(3.0f, 6.0f)
             .requiresCorrectToolForDrops()
+            .noOcclusion()
     )
 
     val USER: Block = register(
@@ -178,6 +183,7 @@ object ModBlocks {
         BlockBehaviour.Properties.of()
             .strength(3.0f, 6.0f)
             .requiresCorrectToolForDrops()
+            .noOcclusion()
     )
 
     /** Crafting-only frame block. Combines the common ingredients shared by
@@ -330,6 +336,8 @@ object ModBlocks {
             .strength(3.0f, 6.0f)
             .sound(net.minecraft.world.level.block.SoundType.COPPER)
             .requiresCorrectToolForDrops()
+            .noOcclusion(),
+        itemFactory = { block, props -> damien.nodeworks.item.ChestBlockItem(block, props, damien.nodeworks.item.ChestBlockItem::describeImport) },
     )
 
     /** Export Chest. Buffer + network output device. Mirror of [IMPORT_CHEST]. */
@@ -340,6 +348,8 @@ object ModBlocks {
             .strength(3.0f, 6.0f)
             .sound(net.minecraft.world.level.block.SoundType.COPPER)
             .requiresCorrectToolForDrops()
+            .noOcclusion(),
+        itemFactory = { block, props -> damien.nodeworks.item.ChestBlockItem(block, props, damien.nodeworks.item.ChestBlockItem::describeExport) },
     )
 
     /** Processing Handler. Block-based equivalent of `network:handle(...)`. The
@@ -351,6 +361,17 @@ object ModBlocks {
         BlockBehaviour.Properties.of()
             .strength(3.0f, 6.0f)
             .requiresCorrectToolForDrops()
+            .noOcclusion()
+    )
+
+    /** The Processing Handler that owns many sets at once. */
+    val MULTI_PROCESSING_HANDLER: Block = register(
+        "multi_processing_handler",
+        ::MultiProcessingHandlerBlock,
+        BlockBehaviour.Properties.of()
+            .strength(3.0f, 6.0f)
+            .requiresCorrectToolForDrops()
+            .noOcclusion()
     )
 
     /** Register a block only, no BlockItem. Used for internal multiblock parts that the
@@ -378,6 +399,9 @@ object ModBlocks {
             .strength(3.0f, 6.0f)
             .requiresCorrectToolForDrops()
             .noOcclusion()
+            // No item form: breaking a segment cascades into destroyBlock on
+            // the antenna base, whose loot table drops the antenna item.
+            .noLootTable()
     )
 
     /** Variant used when the block is a non-NodeBlock (e.g. vanilla AmethystBlock

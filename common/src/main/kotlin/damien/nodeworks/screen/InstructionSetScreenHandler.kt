@@ -5,7 +5,6 @@ import damien.nodeworks.registry.ModScreenHandlers
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.core.registries.BuiltInRegistries
-import net.minecraft.resources.Identifier
 import net.minecraft.world.Container
 import net.minecraft.world.InteractionHand
 import net.minecraft.world.SimpleContainer
@@ -21,6 +20,9 @@ import net.minecraft.world.item.ItemStack
 /**
  * Screen handler for the Instruction Set's 3x3 crafting template editor.
  * Supports two modes: handheld (card in player's hand) or node-based (card in a node slot).
+ *
+ * The grid holds real stacks at count one, components included, so a recipe that only
+ * matches a specific variant can be laid out, resolved and saved as that variant.
  */
 class InstructionSetScreenHandler(
     syncId: Int,
@@ -32,13 +34,18 @@ class InstructionSetScreenHandler(
 
     private val resultContainer = SimpleContainer(1)
 
+    /** The last matched recipe is tried first, so every click on a grid that still matches
+     *  it, and every normalisation trial that keeps matching, skips the full recipe scan. */
+    private val craftingCheck = net.minecraft.world.item.crafting.RecipeManager
+        .createCheck<CraftingInput, net.minecraft.world.item.crafting.CraftingRecipe>(RecipeType.CRAFTING)
+
     /** Snapshot of the recipe grid at open time, captured so [removed] can skip
      *  saving when the user closes without making any changes. Without this,
      *  opening a stack of >1 unprogrammed Instruction Sets and closing the GUI
      *  splits a copy off the stack and writes an empty recipe to it (same path
      *  the >1-stack save uses), leaving the player with a "programmed-empty"
      *  card alongside the original stack. */
-    private val initialRecipe: List<String> = readRecipe()
+    private val initialRecipe: List<ItemStack> = readGrid()
     private val initialSubstitutionsValue: Boolean = initialSubstitutions
 
     /** Slot 0: substitutions toggle (1 = on, 0 = off). Server-synced so the
@@ -54,32 +61,44 @@ class InstructionSetScreenHandler(
     }
 
     companion object {
-        private fun recipeToGrid(recipe: List<String>): SimpleContainer {
+        /** Bound on the recipe lookups one save may spend trimming components. Each lookup
+         *  scans every crafting recipe, and a grid of nine heavily componented stacks could
+         *  otherwise ask for dozens. */
+        private const val MAX_NORMALISE_LOOKUPS = 24
+
+        private fun recipeToGrid(recipe: List<ItemStack>): SimpleContainer {
             val grid = SimpleContainer(9)
             for (i in 0 until 9) {
-                if (recipe[i].isNotEmpty()) {
-                    val id = Identifier.tryParse(recipe[i]) ?: continue
-                    val item = BuiltInRegistries.ITEM.getValue(id) ?: continue
-                    grid.setItem(i, ItemStack(item, 1))
-                }
+                val stack = recipe.getOrNull(i) ?: continue
+                if (!stack.isEmpty) grid.setItem(i, stack.copyWithCount(1))
             }
             return grid
         }
 
         fun createHandheld(syncId: Int, playerInventory: Inventory, hand: InteractionHand, stack: ItemStack): InstructionSetScreenHandler {
-            val recipe = InstructionSet.getRecipe(stack)
+            val recipe = InstructionSet.getRecipeStacks(stack)
             val subs = InstructionSet.getSubstitutions(stack)
             return InstructionSetScreenHandler(syncId, playerInventory, recipeToGrid(recipe), SaveMode.Handheld(hand), subs)
         }
 
         fun createServer(syncId: Int, playerInventory: Inventory, nodePos: BlockPos, side: Direction, slotIndex: Int, stack: ItemStack): InstructionSetScreenHandler {
-            val recipe = InstructionSet.getRecipe(stack)
+            val recipe = InstructionSet.getRecipeStacks(stack)
             val subs = InstructionSet.getSubstitutions(stack)
             return InstructionSetScreenHandler(syncId, playerInventory, recipeToGrid(recipe), SaveMode.InNode(nodePos, side.ordinal, slotIndex), subs)
         }
 
         fun clientFactory(syncId: Int, playerInventory: Inventory, data: InstructionSetOpenData): InstructionSetScreenHandler {
             return InstructionSetScreenHandler(syncId, playerInventory, recipeToGrid(data.recipe), SaveMode.ClientDummy, data.allowSubstitutions)
+        }
+
+        /** True when both grids hold the same item and components in every slot. */
+        private fun sameGrid(a: List<ItemStack>, b: List<ItemStack>): Boolean {
+            if (a.size != b.size) return false
+            for (i in a.indices) {
+                if (a[i].isEmpty != b[i].isEmpty) return false
+                if (!a[i].isEmpty && !ItemStack.isSameItemSameComponents(a[i], b[i])) return false
+            }
+            return true
         }
     }
 
@@ -122,23 +141,92 @@ class InstructionSetScreenHandler(
         override fun mayPickup(player: Player): Boolean = false
     }
 
-    /** Looks up the crafting result from the recipe manager and updates the result slot. */
-    private fun updateResult() {
+    /** The result the recipe manager gives for [items], empty when nothing matches. Null
+     *  when there is no recipe manager to ask, which only happens on the client. */
+    private fun resultFor(items: List<ItemStack>): ItemStack? {
         val level = playerInventory.player.level()
-        if (level.isClientSide) return // Recipe lookup is server-side only
-
-        val serverLevel = level as? net.minecraft.server.level.ServerLevel ?: return
-        val recipeManager = serverLevel.recipeAccess() ?: return
-
-        val items = (0 until 9).map { recipeGrid.getItem(it) }
+        val serverLevel = level as? net.minecraft.server.level.ServerLevel ?: return null
         val input = CraftingInput.of(3, 3, items)
-
-        val result = recipeManager
-            .getRecipeFor(RecipeType.CRAFTING, input, level)
+        return craftingCheck
+            .getRecipeFor(input, serverLevel)
             .map { it.value().assemble(input) }
             .orElse(ItemStack.EMPTY)
+    }
 
+    /** Looks up the crafting result from the recipe manager and updates the result slot. */
+    private fun updateResult() {
+        val result = resultFor(readGrid()) ?: return
         resultContainer.setItem(0, result)
+    }
+
+    /**
+     * Drops the components the recipe does not need, so a worn pickaxe dropped into a
+     * slot does not pin the card to that exact wear. A slot is first tried plain. When
+     * the grid stops giving the same result, each of its component types is tried on
+     * its own and only the ones whose removal breaks the recipe stay, so a tiered module
+     * with a custom name keeps the tier and loses the name. With no matching recipe
+     * every slot goes plain, as the card always stored it. Runs once, on save, and stops
+     * trying after [MAX_NORMALISE_LOOKUPS] recipe lookups, keeping whatever is left.
+     */
+    private fun normaliseGrid() {
+        val grid = readGrid().toMutableList()
+        if (grid.none { !it.isEmpty && it.componentsPatch.size() > 0 }) return
+        val expected = resultFor(grid) ?: return
+        var lookups = 1
+        var changed = false
+        fun sameResult(trial: List<ItemStack>): Boolean? {
+            if (lookups >= MAX_NORMALISE_LOOKUPS) return null
+            lookups++
+            val result = resultFor(trial) ?: return null
+            return !result.isEmpty && result.count == expected.count && ItemStack.isSameItemSameComponents(result, expected)
+        }
+        for (i in 0 until 9) {
+            val stack = grid[i]
+            if (stack.isEmpty || stack.componentsPatch.size() == 0) continue
+            val plain = ItemStack(stack.item, 1)
+            if (expected.isEmpty) {
+                grid[i] = plain
+                changed = true
+                continue
+            }
+            val stripped = grid.toMutableList().also { it[i] = plain }
+            when (sameResult(stripped)) {
+                null -> return applyGrid(grid, changed)
+                true -> {
+                    grid[i] = plain
+                    changed = true
+                    continue
+                }
+                false -> {}
+            }
+            val original = stack.componentsPatch
+            var kept = original
+            for (type in original.entrySet().map { it.key }) {
+                val without = kept.forget { it == type }
+                val trial = grid.toMutableList().also { it[i] = ItemStack(stack.item, 1).apply { applyComponents(without) } }
+                when (sameResult(trial)) {
+                    null -> {
+                        if (kept !== original) {
+                            grid[i] = ItemStack(stack.item, 1).apply { applyComponents(kept) }
+                            changed = true
+                        }
+                        return applyGrid(grid, changed)
+                    }
+                    true -> kept = without
+                    false -> {}
+                }
+            }
+            if (kept !== original) {
+                grid[i] = ItemStack(stack.item, 1).apply { applyComponents(kept) }
+                changed = true
+            }
+        }
+        applyGrid(grid, changed)
+    }
+
+    private fun applyGrid(grid: List<ItemStack>, changed: Boolean) {
+        if (!changed) return
+        for (i in 0 until 9) recipeGrid.setItem(i, grid[i])
     }
 
     override fun clickMenuButton(player: Player, id: Int): Boolean {
@@ -165,7 +253,7 @@ class InstructionSetScreenHandler(
             if (carried.isEmpty) {
                 recipeGrid.setItem(slotId, ItemStack.EMPTY)
             } else {
-                recipeGrid.setItem(slotId, ItemStack(carried.item, 1))
+                recipeGrid.setItem(slotId, carried.copyWithCount(1))
             }
             updateResult()
             return
@@ -183,7 +271,7 @@ class InstructionSetScreenHandler(
             val stack = slot.item
             for (i in 0..8) {
                 if (recipeGrid.getItem(i).isEmpty) {
-                    recipeGrid.setItem(i, ItemStack(stack.item, 1))
+                    recipeGrid.setItem(i, stack.copyWithCount(1))
                     updateResult()
                     break
                 }
@@ -198,18 +286,48 @@ class InstructionSetScreenHandler(
         // Skip the save (and the >1-stack split-copy side effect) when the user
         // closes without changing anything. See [initialRecipe] for the bug
         // this guards against.
-        val recipe = readRecipe()
         val subs = getSubstitutions()
-        if (recipe == initialRecipe && subs == initialSubstitutionsValue) return
-        saveRecipe(player, recipe, subs)
+        if (sameGrid(readGrid(), initialRecipe) && subs == initialSubstitutionsValue) {
+            backfillOutputStack(player)
+            return
+        }
+        normaliseGrid()
+        updateResult()
+        saveRecipe(player, readGrid(), subs)
     }
 
-    private fun readRecipe(): List<String> = (0 until 9).map { i ->
+    /** Give an older card its output stack on open. Only adds the component, and only
+     *  when the result is the item the card already outputs. */
+    private fun backfillOutputStack(player: Player) {
+        val result = resultContainer.getItem(0)
+        if (result.isEmpty) return
+        val card = when (val mode = saveMode) {
+            is SaveMode.Handheld -> player.getItemInHand(mode.hand)
+            is SaveMode.InNode -> {
+                val node = player.level().getBlockEntity(mode.nodePos) as? damien.nodeworks.block.entity.NodeBlockEntity ?: return
+                val side = Direction.entries[mode.sideOrdinal]
+                node.getItem(side.ordinal * damien.nodeworks.block.entity.NodeBlockEntity.SLOTS_PER_SIDE + mode.slotIndex)
+            }
+            is SaveMode.ClientDummy -> return
+        }
+        if (card.item !is InstructionSet) return
+        if (card.has(damien.nodeworks.registry.ModDataComponents.INSTRUCTION_SET_OUTPUT)) return
+        InstructionSet.setOutputStack(card, result)
+        if (card.has(damien.nodeworks.registry.ModDataComponents.INSTRUCTION_SET_OUTPUT)) {
+            (saveMode as? SaveMode.InNode)?.let { mode ->
+                (player.level().getBlockEntity(mode.nodePos) as? damien.nodeworks.block.entity.NodeBlockEntity)?.setChanged()
+            }
+        }
+    }
+
+    /** The nine grid slots as copies, so later edits to the grid never reach a snapshot. */
+    private fun readGrid(): List<ItemStack> = (0 until 9).map { i ->
         val stack = recipeGrid.getItem(i)
-        if (stack.isEmpty) "" else BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: ""
+        if (stack.isEmpty) ItemStack.EMPTY else stack.copyWithCount(1)
     }
 
-    private fun saveRecipe(player: Player, recipe: List<String>, allowSubstitutions: Boolean) {
+    private fun saveRecipe(player: Player, grid: List<ItemStack>, allowSubstitutions: Boolean) {
+        val recipe = InstructionSet.idsOf(grid)
         val resultStack = resultContainer.getItem(0)
         val output = if (resultStack.isEmpty) "" else BuiltInRegistries.ITEM.getKey(resultStack.item)?.toString() ?: ""
         // Recipe-resolved yield (e.g. 3 for the door recipe). Persisted so the
@@ -229,13 +347,13 @@ class InstructionSetScreenHandler(
                     // it into the player's inventory.
                     if (stack.count > 1) {
                         val configured = stack.copyWithCount(1)
-                        InstructionSet.setRecipe(configured, recipe, output, outputCount, allowSubstitutions)
+                        InstructionSet.setRecipe(configured, recipe, output, outputCount, allowSubstitutions, resultStack, grid)
                         stack.shrink(1)
                         if (!player.inventory.add(configured)) {
                             player.drop(configured, false)
                         }
                     } else {
-                        InstructionSet.setRecipe(stack, recipe, output, outputCount, allowSubstitutions)
+                        InstructionSet.setRecipe(stack, recipe, output, outputCount, allowSubstitutions, resultStack, grid)
                     }
                 }
             }
@@ -246,7 +364,7 @@ class InstructionSetScreenHandler(
                 val globalSlot = side.ordinal * damien.nodeworks.block.entity.NodeBlockEntity.SLOTS_PER_SIDE + mode.slotIndex
                 val cardStack = nodeEntity.getItem(globalSlot)
                 if (cardStack.item is InstructionSet) {
-                    InstructionSet.setRecipe(cardStack, recipe, output, outputCount, allowSubstitutions)
+                    InstructionSet.setRecipe(cardStack, recipe, output, outputCount, allowSubstitutions, resultStack, grid)
                     nodeEntity.setChanged()
                 }
             }
@@ -258,16 +376,13 @@ class InstructionSetScreenHandler(
 
     fun getRecipeGrid(): Container = recipeGrid
 
-    /** Sets the 3x3 recipe grid from a list of item ID strings (used by JEI integration). */
-    fun setRecipeFromIds(items: List<String>) {
+    /** Sets the 3x3 recipe grid from recipe view stacks (used by JEI integration). One
+     *  recipe lookup, the same as a click, so a flood of these packets costs no more than
+     *  a flood of clicks. Components the recipe does not need are dropped on save. */
+    fun setRecipeFromStacks(items: List<ItemStack>) {
         for (i in 0 until minOf(9, items.size)) {
-            if (items[i].isEmpty()) {
-                recipeGrid.setItem(i, ItemStack.EMPTY)
-            } else {
-                val id = Identifier.tryParse(items[i]) ?: continue
-                val item = BuiltInRegistries.ITEM.getValue(id) ?: continue
-                recipeGrid.setItem(i, ItemStack(item, 1))
-            }
+            val stack = items[i]
+            recipeGrid.setItem(i, if (stack.isEmpty) ItemStack.EMPTY else stack.copyWithCount(1))
         }
         updateResult()
         broadcastChanges()

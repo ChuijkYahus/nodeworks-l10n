@@ -17,6 +17,7 @@ import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.InteractionResult
 import net.minecraft.world.item.Item
+import net.minecraft.world.item.ItemStack
 import net.minecraft.world.item.context.UseOnContext
 
 class DiagnosticToolItem(properties: Properties) : Item(properties) {
@@ -114,7 +115,11 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
                 is damien.nodeworks.block.entity.UserBlockEntity -> "user"
                 is damien.nodeworks.block.entity.ImportChestBlockEntity -> "import_chest"
                 is damien.nodeworks.block.entity.ExportChestBlockEntity -> "export_chest"
+                is damien.nodeworks.block.entity.MultiProcessingHandlerBlockEntity -> "multi_processing_handler"
                 is damien.nodeworks.block.entity.ProcessingHandlerBlockEntity -> "processing_handler"
+                is damien.nodeworks.block.entity.CraftRequesterBlockEntity -> "craft_requester"
+                is damien.nodeworks.block.entity.StorageMeterBlockEntity -> "storage_meter"
+                is damien.nodeworks.block.entity.MonitorBlockEntity -> "monitor"
                 else -> "unknown"
             }
 
@@ -144,6 +149,9 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
             // Build detail lines based on block type
             val details = mutableListOf<String>()
             when (entity) {
+                is NodeBlockEntity -> {
+                    for (line in entity.transferStatus()) details.add(line)
+                }
                 is NetworkControllerBlockEntity -> {
                     // Mirror the player-visible rows in [NetworkControllerScreen]
                     // so the diagnostic and the controller GUI stay in sync.
@@ -172,6 +180,7 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
                 is damien.nodeworks.block.entity.CraftingCoreBlockEntity -> {
                     details.add("Buffer: ${entity.bufferUsed} / ${entity.bufferCapacity}")
                     details.add("Formed: ${if (entity.isFormed) "yes" else "no"}")
+                    entity.drivenBy?.let { details.add("Standby: Core at ${it.x}, ${it.y}, ${it.z} drives this structure") }
                     if (entity.isCrafting) details.add("Crafting: ${entity.currentCraftItem}")
                     details.add("Efficiency: ${(entity.throttle * 100f).toInt()}%")
                     if (entity.lastFailureReason.isNotEmpty()) {
@@ -236,8 +245,22 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
                         details.add("Filter: (none, idle)")
                     } else {
                         details.add("Filter rules: ${entity.filterRules.size}")
-                        for (rule in entity.filterRules) details.add("  $rule")
+                        // Marked so the inspector draws the rule with an example item beside it. A
+                        // rule may be as long as the line cap itself, so it is cut to leave room.
+                        val roomForRule = damien.nodeworks.screen.DiagnosticOpenData.MAX_DETAIL_CHARS - "__rule:".length
+                        for (rule in entity.filterRules) {
+                            val shown = if (rule.length > roomForRule) rule.take(roomForRule - 1) + "\u2026" else rule
+                            details.add("__rule:$shown")
+                        }
                     }
+                }
+                is damien.nodeworks.block.entity.MultiProcessingHandlerBlockEntity -> {
+                    val names = entity.boundSetNames()
+                    details.add(if (names.isEmpty()) "Not bound" else "Recipes: ${names.size}")
+                    details.add(labelledChannelMarker("Inputs", damien.nodeworks.network.ChannelFilter.Color(entity.inputChannel)))
+                    details.add(labelledChannelMarker("Outputs", damien.nodeworks.network.ChannelFilter.Color(entity.outputChannel)))
+                    // The inspector draws each as a grid from the streamed Processing Sets.
+                    for (name in names) details.add("__mset:$name")
                 }
                 is damien.nodeworks.block.entity.ProcessingHandlerBlockEntity -> {
                     // Recipe NAME is hidden, processing-set names from JEI etc.
@@ -269,6 +292,30 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
                             }
                         }
                     }
+                }
+                is damien.nodeworks.block.entity.CraftRequesterBlockEntity -> {
+                    details.add("Target: ${formatTarget(entity.target)}")
+                    details.add("Batch: ${entity.batchSize}")
+                    details.add(channelFilterMarker(entity.outputChannel))
+                    details.add("Signal: ${if (entity.signalActive) "powered" else "idle"}")
+                    if (entity.hasActiveJob) details.add("Crafting: yes")
+                    entity.errorLines.lastOrNull()?.let { details.add("__error:$it") }
+                }
+                is damien.nodeworks.block.entity.StorageMeterBlockEntity -> {
+                    details.add("Target: ${formatTarget(entity.target)}")
+                    details.add("Stored: ${entity.displayCount}")
+                    // 0 disables the meter entirely, call that out rather than
+                    // leaving the player to infer it from the number.
+                    details.add("Threshold: ${if (entity.threshold == 0) "0 (disabled)" else entity.threshold.toString()}")
+                    details.add(channelFilterMarker(entity.channel))
+                    details.add("Autocraft: ${if (entity.autocraftEnabled) "on" else "off"}")
+                    details.add("Below threshold: ${if (entity.isBelowThreshold) "yes" else "no"}")
+                    if (entity.hasActiveJob) details.add("Crafting: yes")
+                    entity.errorLines.lastOrNull()?.let { details.add("__error:$it") }
+                }
+                is damien.nodeworks.block.entity.MonitorBlockEntity -> {
+                    details.add("Tracking: ${formatItemId(entity.trackedItemId)}")
+                    details.add("Count: ${entity.displayCount}")
                 }
                 else -> {}
             }
@@ -315,8 +362,11 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
             val terminal = level.getBlockEntity(tPos) as? damien.nodeworks.block.entity.TerminalBlockEntity ?: return@mapNotNull null
             val isRunning = PlatformServices.modState.isScriptRunning(serverLevel, tPos)
             val handlers = if (isRunning) {
-                val engine = PlatformServices.modState.getScriptEngine(serverLevel, tPos)
-                (engine as? damien.nodeworks.script.ScriptEngine)?.processingHandlers?.keys?.toList() ?: emptyList()
+                val engine = PlatformServices.modState.getScriptEngine(serverLevel, tPos) as? damien.nodeworks.script.ScriptEngine
+                if (engine == null) emptyList()
+                // The open packet carries each name in at most 64 chars, a long rule is cut.
+                else engine.processingHandlers.keys.toList() +
+                    engine.recipeRules.filter { it.active }.map { if (it.label.length > 64) it.label.take(61) + "..." else it.label }
             } else emptyList()
             DiagnosticOpenData.TerminalInfo(
                 tPos, isRunning, terminal.scripts.keys.toList(), handlers, terminal.autoRun
@@ -406,6 +456,21 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
     private fun formatFilter(rule: String): String =
         if (rule.isEmpty()) "*" else rule
 
+    /** Hover name so component-bearing targets read as the player sees them,
+     *  e.g. "Potion of Strength" rather than `minecraft:potion`. */
+    private fun formatTarget(stack: ItemStack): String =
+        if (stack.isEmpty) "(none)" else stack.hoverName.string
+
+    /** Same display as [formatTarget] for devices that store a bare item id.
+     *  Falls back to the raw id when the item is no longer registered. */
+    private fun formatItemId(itemId: String?): String {
+        if (itemId.isNullOrEmpty()) return "(none)"
+        val id = net.minecraft.resources.Identifier.tryParse(itemId) ?: return itemId
+        val item = net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(id)
+        if (item == net.minecraft.world.item.Items.AIR) return itemId
+        return ItemStack(item).hoverName.string
+    }
+
     /** Maps the 0/1/2 [redstoneMode] enum to a human label. Matches the values
      *  in [BreakerBlockEntity]/[PlacerBlockEntity]/[UserBlockEntity]: 0 is
      *  Ignored, 1 is active-on-low, 2 is active-on-high. */
@@ -434,6 +499,11 @@ class DiagnosticToolItem(properties: Properties) : Item(properties) {
         is damien.nodeworks.network.ChannelFilter.All -> "__channel:ALL"
         is damien.nodeworks.network.ChannelFilter.Color -> channelMarker(channel.color)
     }
+
+    /** [channelFilterMarker] with its own label in place of "Channel", so a device with
+     *  two channels can show "Inputs" and "Outputs" as swatches. */
+    private fun labelledChannelMarker(label: String, channel: damien.nodeworks.network.ChannelFilter): String =
+        "__channelL:$label|" + channelFilterMarker(channel).removePrefix("__channel:")
 
     /** Marker for one Processing Handler ingredient row, used for both the
      *  inputs and outputs lists. Renders as `[item icon] [wool swatch] <ChannelName>`.

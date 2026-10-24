@@ -21,8 +21,10 @@ import net.minecraft.world.level.block.RenderShape
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.entity.BlockEntityTicker
 import net.minecraft.world.level.block.entity.BlockEntityType
+import net.minecraft.world.level.block.SimpleWaterloggedBlock
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.block.state.StateDefinition
+import net.minecraft.world.level.material.FluidState
 import net.minecraft.world.level.block.state.properties.BlockStateProperties
 import net.minecraft.world.phys.BlockHitResult
 import net.minecraft.world.phys.shapes.Shapes
@@ -41,7 +43,7 @@ import net.minecraft.world.phys.shapes.VoxelShape
  * Right-click with the already-configured item also opens the GUI.
  * Right-click while holding a wrench rotates the block via [Wrenchable].
  */
-class StorageMeterBlock(properties: Properties) : BaseEntityBlock(properties), Wrenchable {
+class StorageMeterBlock(properties: Properties) : BaseEntityBlock(properties), Wrenchable, SimpleWaterloggedBlock {
 
     companion object {
         val CODEC: MapCodec<StorageMeterBlock> = simpleCodec(::StorageMeterBlock)
@@ -59,12 +61,15 @@ class StorageMeterBlock(properties: Properties) : BaseEntityBlock(properties), W
     }
 
     init {
-        registerDefaultState(stateDefinition.any().setValue(FACING, Direction.NORTH))
+        registerDefaultState(stateDefinition.any().setValue(FACING, Direction.NORTH).setValue(WATERLOGGED, false))
     }
 
     override fun createBlockStateDefinition(builder: StateDefinition.Builder<Block, BlockState>) {
-        builder.add(FACING)
+        builder.add(FACING, WATERLOGGED)
     }
+
+    override fun getFluidState(state: BlockState): FluidState =
+        waterloggedFluid(state) ?: super.getFluidState(state)
 
     override fun codec(): MapCodec<out BaseEntityBlock> = CODEC
     override fun getRenderShape(state: BlockState): RenderShape = RenderShape.MODEL
@@ -72,6 +77,7 @@ class StorageMeterBlock(properties: Properties) : BaseEntityBlock(properties), W
 
     override fun getStateForPlacement(context: BlockPlaceContext): BlockState =
         defaultBlockState().setValue(FACING, context.horizontalDirection.opposite)
+            .setValue(WATERLOGGED, context.placedInWater())
 
     override fun newBlockEntity(pos: BlockPos, state: BlockState): BlockEntity =
         StorageMeterBlockEntity(pos, state)
@@ -100,6 +106,9 @@ class StorageMeterBlock(properties: Properties) : BaseEntityBlock(properties), W
         if (handItem is NetworkWrenchItem || handItem is DiagnosticToolItem) return InteractionResult.PASS
         if (level.isClientSide) return InteractionResult.SUCCESS
         val entity = level.getBlockEntity(pos) as? StorageMeterBlockEntity ?: return InteractionResult.PASS
+        if (!damien.nodeworks.network.ControllerRequired.check(level as net.minecraft.server.level.ServerLevel, pos, player)) {
+            return InteractionResult.SUCCESS
+        }
         val serverPlayer = player as ServerPlayer
         PlatformServices.menu.openExtendedMenu(
             serverPlayer,
@@ -140,6 +149,9 @@ class StorageMeterBlock(properties: Properties) : BaseEntityBlock(properties), W
         if (level.isClientSide) return InteractionResult.SUCCESS
         val entity = level.getBlockEntity(pos) as? StorageMeterBlockEntity
             ?: return InteractionResult.TRY_WITH_EMPTY_HAND
+        if (!damien.nodeworks.network.ControllerRequired.check(level as net.minecraft.server.level.ServerLevel, pos, player)) {
+            return InteractionResult.SUCCESS
+        }
         if (net.minecraft.world.item.ItemStack.isSameItemSameComponents(stack, entity.target)) {
             return InteractionResult.TRY_WITH_EMPTY_HAND
         }

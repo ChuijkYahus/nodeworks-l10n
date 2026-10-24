@@ -36,13 +36,17 @@ data class TerminalOpenData(
             buf.writeVarInt(api.inputs.size)
             for (ingr in api.inputs) {
                 buf.writeUtf(ingr.itemId, 256); buf.writeVarInt(ingr.count)
+                // The tag names the Lua parameter, so autocomplete must see it too.
+                buf.writeUtf(ingr.tag ?: "", 256)
             }
             buf.writeVarInt(api.outputs.size)
             for (ingr in api.outputs) {
                 buf.writeUtf(ingr.itemId, 256); buf.writeVarInt(ingr.count)
+                buf.writeBoolean(ingr.optional)
             }
             buf.writeVarInt(api.timeout)
             buf.writeBoolean(api.serial)
+            buf.writeBoolean(api.fuzzy)
         }
 
         private fun readApi(buf: FriendlyByteBuf): ProcessingStorageBlockEntity.ProcessingApiInfo {
@@ -52,10 +56,11 @@ data class TerminalOpenData(
             repeat(inputCount) {
                 val id = buf.readUtf(256)
                 val count = buf.readVarInt()
+                val tag = buf.readUtf(256).takeIf { it.isNotEmpty() }
                 val identifier = net.minecraft.resources.Identifier.tryParse(id)
                 val item = identifier?.let { net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(it) }
                 if (item != null) {
-                    inputs.add(damien.nodeworks.script.RecipeIngredient(net.minecraft.world.item.ItemStack(item), count))
+                    inputs.add(damien.nodeworks.script.RecipeIngredient(net.minecraft.world.item.ItemStack(item), count, tag))
                 }
             }
             val outputCount = buf.readVarInt()
@@ -63,15 +68,17 @@ data class TerminalOpenData(
             repeat(outputCount) {
                 val id = buf.readUtf(256)
                 val count = buf.readVarInt()
+                val optional = buf.readBoolean()
                 val identifier = net.minecraft.resources.Identifier.tryParse(id)
                 val item = identifier?.let { net.minecraft.core.registries.BuiltInRegistries.ITEM.getValue(it) }
                 if (item != null) {
-                    outputs.add(damien.nodeworks.script.RecipeIngredient(net.minecraft.world.item.ItemStack(item), count))
+                    outputs.add(damien.nodeworks.script.RecipeIngredient(net.minecraft.world.item.ItemStack(item), count, optional = optional))
                 }
             }
             val timeout = buf.readVarInt()
             val serial = buf.readBoolean()
-            return ProcessingStorageBlockEntity.ProcessingApiInfo(name, inputs, outputs, timeout, serial)
+            val fuzzy = buf.readBoolean()
+            return ProcessingStorageBlockEntity.ProcessingApiInfo(name, inputs, outputs, timeout, serial, fuzzy)
         }
 
         val STREAM_CODEC: StreamCodec<FriendlyByteBuf, TerminalOpenData> = object : StreamCodec<FriendlyByteBuf, TerminalOpenData> {

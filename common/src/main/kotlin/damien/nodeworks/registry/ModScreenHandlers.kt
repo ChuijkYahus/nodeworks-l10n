@@ -36,6 +36,7 @@ object ModScreenHandlers {
     lateinit var DIAGNOSTIC: MenuType<DiagnosticMenu>
     lateinit var CARD_PROGRAMMER: MenuType<damien.nodeworks.screen.CardProgrammerMenu>
     lateinit var STORAGE_CARD: MenuType<damien.nodeworks.screen.StorageCardMenu>
+    lateinit var TRANSFER_CARD: MenuType<damien.nodeworks.screen.TransferCardMenu>
     lateinit var CARD_SETTINGS: MenuType<damien.nodeworks.screen.CardSettingsMenu>
     lateinit var BREAKER: MenuType<damien.nodeworks.screen.BreakerMenu>
     lateinit var PLACER: MenuType<damien.nodeworks.screen.PlacerMenu>
@@ -43,6 +44,7 @@ object ModScreenHandlers {
     lateinit var EXPORT_CHEST: MenuType<damien.nodeworks.screen.ExportChestMenu>
     lateinit var USER: MenuType<damien.nodeworks.screen.UserMenu>
     lateinit var PROCESSING_HANDLER: MenuType<damien.nodeworks.screen.ProcessingHandlerMenu>
+    lateinit var MULTI_PROCESSING_HANDLER: MenuType<damien.nodeworks.screen.MultiProcessingHandlerMenu>
     lateinit var STORAGE_METER: MenuType<damien.nodeworks.screen.StorageMeterMenu>
     lateinit var CRAFT_REQUESTER: MenuType<damien.nodeworks.screen.CraftRequesterMenu>
 

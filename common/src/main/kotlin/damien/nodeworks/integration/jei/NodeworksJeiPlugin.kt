@@ -3,6 +3,7 @@ package damien.nodeworks.integration.jei
 import damien.nodeworks.network.SetInstructionGridPayload
 import damien.nodeworks.network.SetProcessingApiDataPayload
 import damien.nodeworks.network.SetProcessingApiSlotPayload
+import damien.nodeworks.network.SetProcessingApiSlotTagPayload
 import damien.nodeworks.platform.PlatformServices
 import damien.nodeworks.registry.ModScreenHandlers
 import damien.nodeworks.screen.InstructionSetScreenHandler
@@ -12,6 +13,7 @@ import damien.nodeworks.screen.BreakerScreen
 import damien.nodeworks.screen.ExportChestScreen
 import damien.nodeworks.screen.PlacerScreen
 import damien.nodeworks.screen.StorageCardScreen
+import damien.nodeworks.screen.TransferCardScreen
 import damien.nodeworks.screen.UserScreen
 import mezz.jei.api.IModPlugin
 import mezz.jei.api.JeiPlugin
@@ -105,6 +107,10 @@ class NodeworksJeiPlugin : IModPlugin {
         registration.addGhostIngredientHandler(
             StorageCardScreen::class.java,
             StorageCardGhostHandler()
+        )
+        registration.addGhostIngredientHandler(
+            TransferCardScreen::class.java,
+            TransferCardGhostHandler()
         )
         registration.addGhostIngredientHandler(
             ExportChestScreen::class.java,
@@ -232,10 +238,17 @@ class InventoryTerminalTransferHandler :
         return if (missing.isEmpty()) null else MissingIngredientsError(missing)
     }
 
-    /** For each recipe input slot, decide whether any of its accepted items
-     *  can be sourced from the player's inventory, the crafting grid the
-     *  [+] would overwrite, or the network. Greedy first-fit with running
-     *  availability so one stack doesn't satisfy multiple slots. */
+    /**
+     * For each recipe input slot, decide whether any of its accepted items can be sourced
+     * from the player's inventory, the crafting grid the [+] would overwrite, the
+     * network, or a finished craft held in the pinned row. Greedy first-fit with running
+     * availability so one stack does not satisfy several slots.
+     *
+     * Stock is tallied per item id and component variant. A slot that shows a plain item
+     * is a plain ingredient and any variant of that item serves it, as the server fill
+     * takes plain copies first and any variant after. A slot that shows a specific
+     * variant is only served by that variant.
+     */
     private fun findMissingInputs(
         menu: damien.nodeworks.screen.InventoryTerminalMenu,
         player: Player,
@@ -243,31 +256,30 @@ class InventoryTerminalTransferHandler :
     ): List<IRecipeSlotView> {
         if (inputSlots.isEmpty()) return emptyList()
 
-        val available = HashMap<String, Long>()
-        for (i in 0 until player.inventory.containerSize) {
-            val stack = player.inventory.getItem(i)
-            if (stack.isEmpty) continue
-            val id = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
-            available.merge(id, stack.count.toLong(), Long::plus)
+        val available = HashMap<VariantKey, Long>()
+        fun add(itemId: String, patch: net.minecraft.core.component.DataComponentPatch, count: Long) {
+            if (count > 0) available.merge(VariantKey(itemId, patch), count, Long::plus)
         }
-        for (i in 0 until 9) {
-            val stack = menu.craftingContainer.getItem(i)
-            if (stack.isEmpty) continue
-            val id = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
-            available.merge(id, stack.count.toLong(), Long::plus)
+        fun add(stack: ItemStack) {
+            if (stack.isEmpty) return
+            val id = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: return
+            add(id, stack.componentsPatch, stack.count.toLong())
         }
-        // Only query the repo for ids the recipe mentions, so a huge
-        // network doesn't pay for every stored item id every probe.
+        for (i in 0 until player.inventory.containerSize) add(player.inventory.getItem(i))
+        for (i in 0 until 9) add(menu.craftingContainer.getItem(i))
+        // Only query the repo for ids the recipe mentions, so a huge network does not pay
+        // for every stored item id every probe.
         val screen = damien.nodeworks.screen.InventoryTerminalScreen.activeScreen
         if (screen != null && screen.menu === menu) {
+            // The grid entries arrive with the craft queue's reserved counts taken out, so
+            // items a finished craft holds in the pinned row only show up here. The fill
+            // on the server takes from storage directly, so they are usable.
+            for (queued in screen.craftQueue) add(queued.itemId, queued.componentsPatch, queued.availableCount.toLong())
             val sampled = HashSet<String>()
             for (slot in inputSlots) {
                 slot.getItemStacks().forEach { stack ->
                     val id = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: return@forEach
-                    if (sampled.add(id)) {
-                        val networkCount = screen.repo.countItem(id)
-                        if (networkCount > 0) available.merge(id, networkCount, Long::plus)
-                    }
+                    if (sampled.add(id)) screen.repo.forEachVariant(id) { patch, count -> add(id, patch, count) }
                 }
             }
         }
@@ -275,13 +287,11 @@ class InventoryTerminalTransferHandler :
         val missing = mutableListOf<IRecipeSlotView>()
         for (slot in inputSlots) {
             val candidates = slot.getItemStacks().toList()
-            if (candidates.isEmpty()) continue  // no-ingredient slot, doesn't count as missing
+            if (candidates.isEmpty()) continue  // no-ingredient slot, does not count as missing
             var satisfied = false
             for (stack in candidates) {
                 val id = BuiltInRegistries.ITEM.getKey(stack.item)?.toString() ?: continue
-                val have = available[id] ?: 0L
-                if (have >= stack.count) {
-                    available[id] = have - stack.count
+                if (takeVariant(available, id, stack.componentsPatch, stack.count.toLong())) {
                     satisfied = true
                     break
                 }
@@ -289,6 +299,40 @@ class InventoryTerminalTransferHandler :
             if (!satisfied) missing.add(slot)
         }
         return missing
+    }
+
+    /** Item id plus components. [DataComponentPatch] compares structurally, so two
+     *  Strength Potions key alike and a Fire Resistance one does not. */
+    private data class VariantKey(val itemId: String, val patch: net.minecraft.core.component.DataComponentPatch)
+
+    /** Takes [need] of [itemId] from [available]: the exact variant when [patch] names
+     *  one, else the plain stock first and any variant after, drawing across variants
+     *  when no single one covers the need. */
+    private fun takeVariant(
+        available: HashMap<VariantKey, Long>,
+        itemId: String,
+        patch: net.minecraft.core.component.DataComponentPatch,
+        need: Long,
+    ): Boolean {
+        if (!patch.isEmpty) {
+            val key = VariantKey(itemId, patch)
+            val have = available[key] ?: 0L
+            if (have < need) return false
+            available[key] = have - need
+            return true
+        }
+        val keys = available.keys.filter { it.itemId == itemId && (available[it] ?: 0L) > 0L }
+            .sortedBy { if (it.patch.isEmpty) 0 else 1 }
+        if (keys.sumOf { available[it] ?: 0L } < need) return false
+        var left = need
+        for (key in keys) {
+            if (left <= 0L) break
+            val have = available[key] ?: 0L
+            val take = minOf(have, left)
+            available[key] = have - take
+            left -= take
+        }
+        return left <= 0L
     }
 }
 
@@ -350,7 +394,8 @@ class InstructionSetTransferHandler :
         doTransfer: Boolean
     ): IRecipeTransferError? {
         if (doTransfer) {
-            val grid = Array(9) { "" }
+            // Stacks, not ids, so an ingredient that only matches with its components keeps them.
+            val grid = Array(9) { ItemStack.EMPTY }
             val inputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.INPUT)
             for ((index, slotView) in inputSlots.withIndex()) {
                 if (index >= 9) break
@@ -358,7 +403,7 @@ class InstructionSetTransferHandler :
                 if (displayed.isPresent) {
                     val ingredient = displayed.get().ingredient
                     if (ingredient is ItemStack && !ingredient.isEmpty) {
-                        grid[index] = BuiltInRegistries.ITEM.getKey(ingredient.item)?.toString() ?: ""
+                        grid[index] = ingredient.copyWithCount(1)
                     }
                 }
             }
@@ -388,13 +433,26 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
         maxTransfer: Boolean,
         doTransfer: Boolean
     ): IRecipeTransferError? {
+        val inputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.INPUT)
+        val outputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.OUTPUT)
+        val inputOverflow = inputSlots.size - ProcessingSetScreenHandler.INPUT_SLOTS
+        val outputOverflow = outputSlots.size - ProcessingSetScreenHandler.OUTPUT_SLOTS
         if (doTransfer) {
+            // One packet empties every cell, then only the recipe's slots are written, by
+            // backing index, so the transfer never depends on where the window is scrolled.
+            PlatformServices.clientNetworking.sendToServer(
+                SetProcessingApiDataPayload(container.containerId, "clear", 0, 0)
+            )
+            container.clearAll()
+            // The recipe lands from the top row, so show the top row.
+            container.scrollRow = 0
             // Input role slots → the Processing Set's input section. We read roles via
             //  IRecipeSlotsView so this works for any recipe category (crafting / smelting
             //  / modded machine), not just CraftingRecipe.
-            val inputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.INPUT)
-            for (index in 0 until ProcessingSetScreenHandler.INPUT_SLOTS) {
-                val (stack, count) = extractStackAndCount(inputSlots.getOrNull(index))
+            for (index in 0 until minOf(inputSlots.size, ProcessingSetScreenHandler.INPUT_SLOTS)) {
+                val slotView = inputSlots.getOrNull(index)
+                val (stack, count) = extractStackAndCount(slotView)
+                if (stack.isEmpty) continue
                 PlatformServices.clientNetworking.sendToServer(
                     SetProcessingApiSlotPayload(container.containerId, index, stack)
                 )
@@ -403,11 +461,26 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
                 PlatformServices.clientNetworking.sendToServer(
                     SetProcessingApiDataPayload(container.containerId, "input", index, count)
                 )
+                // A slot JEI shows several items for is a tag ingredient. Keep the tag so
+                // the recipe accepts any member once substitutions are on. The server
+                // clears the tag when it sets the item, so this goes after it.
+                val tag = detectTag(slotView, stack)
+                // Set directly on the client, its slot item only arrives with the next sync.
+                container.inputTags[index] = tag
+                if (tag != null) {
+                    PlatformServices.clientNetworking.sendToServer(
+                        SetProcessingApiSlotTagPayload(container.containerId, index, tag)
+                    )
+                }
             }
 
-            val outputSlots = recipeSlots.getSlotViews(RecipeIngredientRole.OUTPUT)
-            for (index in 0 until ProcessingSetScreenHandler.OUTPUT_SLOTS) {
+            // The mod's recipe object says which outputs are chance-based, JEI itself doesn't.
+            val shownCount = minOf(outputSlots.size, ProcessingSetScreenHandler.OUTPUT_SLOTS)
+            val shown = (0 until shownCount).map { extractStackAndCount(outputSlots.getOrNull(it)).first }
+            val chance = ChanceOutputs.detect(recipe, shown)
+            for (index in 0 until shownCount) {
                 val (stack, count) = extractStackAndCount(outputSlots.getOrNull(index))
+                if (stack.isEmpty) continue
                 PlatformServices.clientNetworking.sendToServer(
                     SetProcessingApiSlotPayload(
                         container.containerId,
@@ -419,8 +492,49 @@ class ProcessingSetTransferHandler : IUniversalRecipeTransferHandler<ProcessingS
                     SetProcessingApiDataPayload(container.containerId, "output", index, count)
                 )
             }
+            // Marks go after every slot payload, so the server judges them against the whole
+            // grid, and never leave a set with no guaranteed output.
+            val marks = BooleanArray(shownCount) { chance.getOrElse(it) { false } && !shown[it].isEmpty }
+            if (shown.indices.none { !shown[it].isEmpty && !marks[it] }) {
+                shown.indices.firstOrNull { !shown[it].isEmpty }?.let { marks[it] = false }
+            }
+            for (index in 0 until shownCount) {
+                container.outputOptional[index] = marks[index]
+                if (marks[index]) {
+                    PlatformServices.clientNetworking.sendToServer(
+                        SetProcessingApiDataPayload(container.containerId, "optional", index, 1)
+                    )
+                }
+            }
+        }
+        // A recipe wider than the set still transfers what fits. The rest is named, so the
+        // player knows what the machine will also want.
+        if (inputOverflow > 0 || outputOverflow > 0) {
+            val parts = ArrayList<String>(2)
+            if (inputOverflow > 0) parts += "$inputOverflow more input" + (if (inputOverflow == 1) "" else "s")
+            if (outputOverflow > 0) parts += "$outputOverflow more output" + (if (outputOverflow == 1) "" else "s")
+            val message = Component.literal("This recipe has " + parts.joinToString(" and ") + " than a Processing Set holds. The first ones were set.")
+            return object : IRecipeTransferError {
+                override fun getType(): IRecipeTransferError.Type = IRecipeTransferError.Type.COSMETIC
+                override fun getTooltip(tooltip: mezz.jei.api.gui.builder.ITooltipBuilder) {
+                    tooltip.add(message)
+                }
+            }
         }
         return null
+    }
+
+    /** The tag behind a JEI ingredient that shows several items: a tag of the example
+     *  item whose members are exactly the shown items, so the recipe never widens past
+     *  what the machine takes. Tags with the same members pick by name, so every client
+     *  records the same one. Null for single-item slots and lists that match no tag. */
+    private fun detectTag(slotView: IRecipeSlotView?, exemplar: ItemStack): String? {
+        if (slotView == null || exemplar.isEmpty) return null
+        val shown = slotView.itemStacks.map { it.item }.toList().toSet()
+        if (shown.size < 2) return null
+        return damien.nodeworks.card.ItemTagLookup.tagsOf(exemplar.item)
+            .filter { damien.nodeworks.card.ItemTagLookup.membersOf(it).toSet() == shown }
+            .minOrNull()
     }
 
     /**
@@ -457,20 +571,14 @@ class ProcessingSetGhostHandler : IGhostIngredientHandler<ProcessingSetScreen> {
         if (itemIngredient !is ItemStack) return targets
 
         val menu = gui.menu
-        // Input slots (0..INPUT_SLOTS-1)
-        for (i in 0 until ProcessingSetScreenHandler.INPUT_SLOTS) {
+        // The window cells. Each target remembers its window slot and maps it to the
+        // backing cell when the drop lands, so the drop goes where the player sees it
+        // whatever the grid is scrolled to.
+        for (i in 0 until ProcessingSetScreenHandler.WINDOW_SLOTS) {
             val slot = menu.slots[i]
             val screenX = gui.getLeft() + slot.x
             val screenY = gui.getTop() + slot.y
             targets.add(GhostTarget(gui, i, Rect2i(screenX, screenY, 16, 16)))
-        }
-        // Output slots (INPUT_SLOTS .. INPUT_SLOTS + OUTPUT_SLOTS - 1)
-        for (i in 0 until ProcessingSetScreenHandler.OUTPUT_SLOTS) {
-            val slotIndex = ProcessingSetScreenHandler.INPUT_SLOTS + i
-            val slot = menu.slots[slotIndex]
-            val screenX = gui.getLeft() + slot.x
-            val screenY = gui.getTop() + slot.y
-            targets.add(GhostTarget(gui, slotIndex, Rect2i(screenX, screenY, 16, 16)))
         }
         return targets
     }
@@ -479,7 +587,7 @@ class ProcessingSetGhostHandler : IGhostIngredientHandler<ProcessingSetScreen> {
 
     private class GhostTarget<I : Any>(
         private val gui: ProcessingSetScreen,
-        private val slotIndex: Int,
+        private val windowSlot: Int,
         private val area: Rect2i
     ) : IGhostIngredientHandler.Target<I> {
 
@@ -487,6 +595,7 @@ class ProcessingSetGhostHandler : IGhostIngredientHandler<ProcessingSetScreen> {
 
         override fun accept(ingredient: I) {
             if (ingredient !is ItemStack || ingredient.isEmpty) return
+            val slotIndex = gui.backingLinearIndex(windowSlot)
             // Carry the full stack (components and all) so dragging a
             // Potion of Strength from JEI lands as the actual variant, not
             // a bare uncraftable potion. The server's setSlotFromStack
@@ -494,6 +603,11 @@ class ProcessingSetGhostHandler : IGhostIngredientHandler<ProcessingSetScreen> {
             PlatformServices.clientNetworking.sendToServer(
                 SetProcessingApiSlotPayload(gui.menu.containerId, slotIndex, ingredient.copyWithCount(1))
             )
+            // A new item means no tag and no optional mark, as the server will decide too.
+            if (slotIndex < ProcessingSetScreenHandler.INPUT_SLOTS) gui.menu.inputTags[slotIndex] = null
+            else if (slotIndex < ProcessingSetScreenHandler.TOTAL_GHOST_SLOTS) {
+                gui.menu.outputOptional[slotIndex - ProcessingSetScreenHandler.INPUT_SLOTS] = false
+            }
         }
     }
 }
@@ -533,8 +647,36 @@ class StorageCardGhostHandler : IGhostIngredientHandler<StorageCardScreen> {
     }
 }
 
+/** The Transfer Card's rule panel takes JEI drops the same way the Storage Card's does. */
+class TransferCardGhostHandler : IGhostIngredientHandler<TransferCardScreen> {
+
+    override fun <I : Any> getTargetsTyped(
+        gui: TransferCardScreen,
+        ingredient: ITypedIngredient<I>,
+        doStart: Boolean
+    ): List<IGhostIngredientHandler.Target<I>> {
+        if (ingredient.ingredient !is ItemStack) return emptyList()
+        val rect = gui.rulePanelDropArea() ?: return emptyList()
+        return listOf(TransferCardRuleTarget(gui, Rect2i(rect[0], rect[1], rect[2], rect[3])))
+    }
+
+    override fun onComplete() {}
+
+    private class TransferCardRuleTarget<I : Any>(
+        private val gui: TransferCardScreen,
+        private val area: Rect2i,
+    ) : IGhostIngredientHandler.Target<I> {
+        override fun getArea(): Rect2i = area
+        override fun accept(ingredient: I) {
+            if (ingredient !is ItemStack || ingredient.isEmpty) return
+            gui.acceptGhostStack(ingredient)
+        }
+    }
+}
+
 /**
- * Mirror of [StorageCardGhostHandler] for the Export Chest GUI: a single drop
+ * Mirror of [StorageCardGhostHandler] for the Export Chest GUI
+: a single drop
  * area covering the rule list panel appends the dropped item's id as a new
  * filter rule.
  */

@@ -24,8 +24,10 @@ import net.minecraft.world.level.block.Rotation
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.entity.BlockEntityTicker
 import net.minecraft.world.level.block.entity.BlockEntityType
+import net.minecraft.world.level.block.SimpleWaterloggedBlock
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.block.state.StateDefinition
+import net.minecraft.world.level.material.FluidState
 import net.minecraft.world.level.block.state.properties.BlockStateProperties
 import net.minecraft.world.phys.BlockHitResult
 import net.minecraft.world.phys.shapes.CollisionContext
@@ -35,10 +37,10 @@ import net.minecraft.world.phys.shapes.VoxelShape
  * Import Chest. Buffer + network input device. See [ImportChestBlockEntity]
  * for runtime semantics.
  */
-class ImportChestBlock(properties: Properties) : BaseEntityBlock(properties), Wrenchable {
+class ImportChestBlock(properties: Properties) : BaseEntityBlock(properties), Wrenchable, SimpleWaterloggedBlock {
 
     init {
-        registerDefaultState(stateDefinition.any().setValue(FACING, Direction.SOUTH))
+        registerDefaultState(stateDefinition.any().setValue(FACING, Direction.SOUTH).setValue(WATERLOGGED, false))
     }
 
     companion object {
@@ -56,11 +58,15 @@ class ImportChestBlock(properties: Properties) : BaseEntityBlock(properties), Wr
     override fun getRenderShape(state: BlockState): RenderShape = RenderShape.MODEL
 
     override fun createBlockStateDefinition(builder: StateDefinition.Builder<Block, BlockState>) {
-        builder.add(FACING)
+        builder.add(FACING, WATERLOGGED)
     }
+
+    override fun getFluidState(state: BlockState): FluidState =
+        waterloggedFluid(state) ?: super.getFluidState(state)
 
     override fun getStateForPlacement(context: BlockPlaceContext): BlockState =
         defaultBlockState().setValue(FACING, context.horizontalDirection.opposite)
+            .setValue(WATERLOGGED, context.placedInWater())
 
     override fun rotate(state: BlockState, rotation: Rotation): BlockState =
         state.setValue(FACING, rotation.rotate(state.getValue(FACING)))
@@ -150,5 +156,23 @@ class ImportChestBlock(properties: Properties) : BaseEntityBlock(properties), Wr
             net.minecraft.world.Containers.dropContents(level, pos, entity)
         }
         return super.playerWillDestroy(level, pos, state, player)
+    }
+
+    /** The loot table lists the bare item. The settings are stamped on here, where
+     *  the block entity is still at hand, so a moved chest comes back configured.
+     *  Runs for every drop path that carries the entity, explosions included. */
+    override fun getDrops(
+        state: BlockState,
+        params: net.minecraft.world.level.storage.loot.LootParams.Builder,
+    ): List<net.minecraft.world.item.ItemStack> {
+        val drops = super.getDrops(state, params)
+        val be = params.getOptionalParameter(net.minecraft.world.level.storage.loot.parameters.LootContextParams.BLOCK_ENTITY)
+            as? ImportChestBlockEntity ?: return drops
+        val tag = be.settingsTag() ?: return drops
+        val data = net.minecraft.world.item.component.TypedEntityData.of(be.type, tag)
+        for (stack in drops) {
+            if (stack.item == asItem()) stack.set(net.minecraft.core.component.DataComponents.BLOCK_ENTITY_DATA, data)
+        }
+        return drops
     }
 }

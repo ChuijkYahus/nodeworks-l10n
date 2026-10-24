@@ -49,7 +49,7 @@ object Stocker {
                     sources = listOf(CardRef.Pool),
                     mode = StockerMode.POOL_OR_CRAFT,
                     craftItemId = id
-                ).apply { filter = id } // ensure uses the concrete item id as the filter so target counts match
+                ).apply { rules.setAllow(listOf(id)); seededFilter = true } // ensure uses the concrete item id as the filter so target counts match
                 engine.registerPreset(b)
                 return b.toLuaTable()
             }
@@ -63,7 +63,7 @@ object Stocker {
                     sources = emptyList(),
                     mode = StockerMode.CRAFT_ONLY,
                     craftItemId = id
-                ).apply { filter = id }
+                ).apply { rules.setAllow(listOf(id)); seededFilter = true }
                 engine.registerPreset(b)
                 return b.toLuaTable()
             }
@@ -98,7 +98,10 @@ class StockerBuilder(
      *  which means the stocker maintains a total item count of any kind). `:ensure` and
      *  `:craft` initialise this to the concrete craft item id so `:keep(n)` counts only
      *  that item in the target. For `:from`, set it with `:filter("...")`. */
-    internal var filter: String = "*"
+    internal val rules = RuleSet()
+
+    /** The run's stack check, built once per run from [rules]. */
+    private var stackPred: (net.minecraft.world.item.ItemStack) -> Boolean = { true }
     internal var target: CardRef? = null
     internal var keepAmount: Int = -1
     internal var batchSize: Int = 0
@@ -144,8 +147,22 @@ class StockerBuilder(
         return this
     }
 
-    fun filter(pattern: String): StockerBuilder {
-        filter = pattern
+    /** True while the allow list holds only the item `:ensure` or `:craft` seeded, so a
+     *  following `:filter` replaces it as it always did rather than adding to it. */
+    internal var seededFilter = false
+
+    fun filter(patterns: List<String>): StockerBuilder {
+        if (seededFilter) {
+            rules.setAllow(patterns)
+            seededFilter = false
+        } else {
+            rules.filter(patterns)
+        }
+        return this
+    }
+
+    fun except(patterns: List<String>): StockerBuilder {
+        rules.except(patterns)
         return this
     }
 
@@ -181,20 +198,21 @@ class StockerBuilder(
     override fun tickOnce() {
         val snapshot = lastSnapshotSeen ?: return
         val level = engine.level
-        val filterPred: (String) -> Boolean = { CardHandle.matchesFilter(it, filter) }
+        stackPred = rules.stackPredicate(level.registryAccess())
+        val filterPred: (String) -> Boolean = rules.idPredicate(damien.nodeworks.platform.ResourceKind.ITEM)
         val targetRef = target ?: return
 
-        // 1. Figure out current stock in the target.
+        // 1. Figure out current stock in the target, on the real stacks so a component
+        //    rule counts only its variant.
         val current = when (targetRef) {
-            is CardRef.Pool -> NetworkStorageHelper.countItems(level, snapshot, filter).toInt()
+            is CardRef.Pool -> NetworkStorageHelper.countItemsInt(level, snapshot, stackPred)
             is CardRef.Channel -> NetworkStorageHelper
-                .countItems(level, snapshot, filter, damien.nodeworks.network.ChannelFilter.Color(targetRef.color))
-                .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                .countItemsInt(level, snapshot, stackPred, damien.nodeworks.network.ChannelFilter.Color(targetRef.color))
             is CardRef.Named -> {
                 val card = resolvedTarget as? ResolvedRef.Card ?: return
                 val storage = CardStorage.forCard(level, card.snapshot, card.faceOverride) ?: return
-                PlatformServices.storage.countItems(storage, filterPred)
-                    .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                PlatformServices.storage.countStacksByPredicate(storage, stackPred)
+                    .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
             }
         }
 
@@ -214,7 +232,7 @@ class StockerBuilder(
         // sources so it needs the explicit move. Pool target needs no drain (CPU's flush
         // already lands in the pool).
         if (mode == StockerMode.CRAFT_ONLY && (targetRef is CardRef.Named || targetRef is CardRef.Channel)) {
-            val drained = movePoolToTarget(snapshot, level, targetRef, filterPred, need.toLong())
+            val drained = capped(need.toLong()) { movePoolToTarget(snapshot, level, targetRef, filterPred, it) }
             need = (need - drained.toInt()).coerceAtLeast(0)
             if (need <= 0) return
         }
@@ -241,18 +259,20 @@ class StockerBuilder(
             when (source) {
                 is ResolvedRef.Card -> {
                     val srcStorage = CardStorage.forCard(level, source.snapshot, source.faceOverride) ?: continue
-                    need -= moveFromStorageToTarget(snapshot, level, srcStorage, targetRef, filterPred, need.toLong())
+                    need -= capped(need.toLong()) { moveFromStorageToTarget(snapshot, level, srcStorage, targetRef, filterPred, it) }
                         .toInt().coerceAtLeast(0)
                 }
                 is ResolvedRef.Pool -> {
-                    need -= movePoolToTarget(snapshot, level, targetRef, filterPred, need.toLong())
+                    need -= capped(need.toLong()) { movePoolToTarget(snapshot, level, targetRef, filterPred, it) }
                         .toInt().coerceAtLeast(0)
                 }
                 is ResolvedRef.ChannelPool -> {
-                    need -= movePoolToTarget(
-                        snapshot, level, targetRef, filterPred, need.toLong(),
-                        sourceChannel = damien.nodeworks.network.ChannelFilter.Color(source.color),
-                    ).toInt().coerceAtLeast(0)
+                    need -= capped(need.toLong()) {
+                        movePoolToTarget(
+                            snapshot, level, targetRef, filterPred, it,
+                            sourceChannel = damien.nodeworks.network.ChannelFilter.Color(source.color),
+                        )
+                    }.toInt().coerceAtLeast(0)
                 }
             }
         }
@@ -270,18 +290,24 @@ class StockerBuilder(
         is CardRef.Named -> {
             val card = resolvedTarget as? ResolvedRef.Card
             val destStorage = card?.let { CardStorage.forCard(level, it.snapshot, it.faceOverride) }
-            if (destStorage == null) 0L
-            else PlatformServices.storage.moveItems(source, destStorage, filterPred, maxCount)
+            // A Storage Card target only takes what its own rules allow, on top of ours.
+            val cardAccept = card?.let { CardStorage.acceptFilter(level, it.snapshot) }
+            val accept: (net.minecraft.world.item.ItemStack) -> Boolean =
+                if (cardAccept == null) stackPred else { stack -> stackPred(stack) && cardAccept(stack) }
+            if (destStorage == null || !CardStorage.hasRoom(source, destStorage, filterPred, maxCount, accept)) 0L
+            else PlatformServices.storage.moveItems(source, destStorage, filterPred, maxCount, accept = accept)
         }
         is CardRef.Pool -> NetworkStorageHelper.insertItems(
-            level, snapshot, source, filter,
+            level, snapshot, source, "*",
             maxCount, engine.routeTable, null, engine.inventoryCache,
             damien.nodeworks.network.ChannelFilter.All,
+            stackPred = stackPred,
         )
         is CardRef.Channel -> NetworkStorageHelper.insertItems(
-            level, snapshot, source, filter,
+            level, snapshot, source, "*",
             maxCount, engine.routeTable, null, engine.inventoryCache,
             damien.nodeworks.network.ChannelFilter.Color(targetRef.color),
+            stackPred = stackPred,
         )
     }
 
@@ -307,13 +333,14 @@ class StockerBuilder(
             var remaining = maxCount
             var totalMoved = 0L
             for (card in NetworkStorageHelper.getStorageCards(snapshot)) {
-                if (remaining <= 0L) break
+                if (remaining <= 0L || damien.nodeworks.platform.MoveDeadline.expired()) break
                 if (!sourceChannel.matches(card.channel)) continue
                 val srcStorage = NetworkStorageHelper.getStorage(level, card) ?: continue
                 val moved = NetworkStorageHelper.insertItems(
-                    level, snapshot, srcStorage, filter,
+                    level, snapshot, srcStorage, "*",
                     remaining, engine.routeTable, null, engine.inventoryCache,
                     targetChannel,
+                    stackPred = stackPred,
                 )
                 totalMoved += moved
                 remaining -= moved
@@ -321,14 +348,15 @@ class StockerBuilder(
             return totalMoved
         }
 
-        // Card target.
+        // Card target. A Storage Card only takes what its own rules allow.
         val card = resolvedTarget as? ResolvedRef.Card ?: return 0L
         val destStorage = CardStorage.forCard(level, card.snapshot, card.faceOverride) ?: return 0L
+        val accept = CardStorage.acceptFilter(level, card.snapshot)
         val cache = engine.inventoryCache
         var remaining = maxCount
         var totalMoved = 0L
         for (poolCard in NetworkStorageHelper.getStorageCards(snapshot)) {
-            if (remaining <= 0L) break
+            if (remaining <= 0L || damien.nodeworks.platform.MoveDeadline.expired()) break
             if (!sourceChannel.matches(poolCard.channel)) continue
             val storage = NetworkStorageHelper.getStorage(level, poolCard) ?: continue
             // Per-variant move so the cache gets a paired onExtracted for
@@ -336,13 +364,14 @@ class StockerBuilder(
             // two variants of one itemId aren't conflated.
             val infos = PlatformServices.storage.findAllItemInfo(storage) { filterPred(it) }
             for (info in infos) {
-                if (remaining <= 0L) break
+                if (remaining <= 0L || damien.nodeworks.platform.MoveDeadline.expired()) break
                 val wantHash = damien.nodeworks.script.BufferKey.componentsHash(info.componentsPatch)
                 val moved = PlatformServices.storage.moveItemsByStackPredicate(
                     storage, destStorage,
                     { stack ->
                         val sid = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
-                        sid == info.itemId && damien.nodeworks.script.BufferKey.componentsHash(stack) == wantHash
+                        sid == info.itemId && damien.nodeworks.script.BufferKey.componentsHash(stack) == wantHash &&
+                            (accept == null || accept(stack)) && stackPred(stack)
                     },
                     remaining,
                 )
@@ -432,9 +461,15 @@ class StockerBuilder(
                 return selfRef.toLuaTable()
             }
         })
-        t.set("filter", object : TwoArgFunction() {
-            override fun call(selfArg: LuaValue, patternArg: LuaValue): LuaValue {
-                selfRef.filter(patternArg.checkjstring())
+        t.set("filter", object : VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs {
+                selfRef.filter(RuleSet.rulesFromArgs(args, 2))
+                return selfRef.toLuaTable()
+            }
+        })
+        t.set("except", object : VarArgFunction() {
+            override fun invoke(args: Varargs): Varargs {
+                selfRef.except(RuleSet.rulesFromArgs(args, 2))
                 return selfRef.toLuaTable()
             }
         })

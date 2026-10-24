@@ -100,6 +100,7 @@ object CraftPlanner {
                         // Variant patch so executePull asks for the specific
                         // variant; it also persists cleanly across reloads.
                         componentsPatch = node.componentsPatch,
+                        exactVariant = node.exactVariant,
                     )
                     op.outputNodeId = node.nodeId
                     ops += op
@@ -120,7 +121,8 @@ object CraftPlanner {
                         dependsOn = inputDeps,
                         processingApiName = node.templateName,
                         inputs = inputs,
-                        outputs = listOf(node.itemId to node.count.toLong())
+                        outputs = listOf(node.itemId to node.count.toLong()),
+                        resolvedInputs = node.resolvedInputs,
                     )
                     op.outputNodeId = node.nodeId
                     ops += op
@@ -145,7 +147,8 @@ object CraftPlanner {
                         recipe = recipe,
                         outputItemId = node.itemId,
                         outputCount = node.count.toLong(),
-                        executions = node.count.toLong()
+                        executions = node.count.toLong(),
+                        recipeStacks = node.resolvedStacks ?: emptyList(),
                     )
                     op.outputNodeId = node.nodeId
                     ops += op

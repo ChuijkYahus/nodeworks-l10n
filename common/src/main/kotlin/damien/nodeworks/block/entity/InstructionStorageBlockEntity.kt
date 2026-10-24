@@ -46,8 +46,21 @@ class InstructionStorageBlockEntity(
     override var blockDestroyed: Boolean = false
     override var networkId: UUID? = null
 
-    /** Returns all non-empty Instruction Set recipes in THIS storage block. */
+    /** The infos for the cards in this block, built once per change rather than on every
+     *  network walk, since a walk over a large network touches every card and each info
+     *  carries nine stacks. Cleared on every slot write and on load. */
+    private var instructionSetsCache: List<InstructionSetInfo>? = null
+
+    /** Returns all non-empty Instruction Set recipes in THIS storage block. The list and
+     *  the stacks in it are shared across walks, readers must not change them. */
     fun getInstructionSets(): List<InstructionSetInfo> {
+        instructionSetsCache?.let { return it }
+        val built = buildInstructionSets()
+        instructionSetsCache = built
+        return built
+    }
+
+    private fun buildInstructionSets(): List<InstructionSetInfo> {
         val result = mutableListOf<InstructionSetInfo>()
         for (i in 0 until TOTAL_SLOTS) {
             val stack = items[i]
@@ -56,9 +69,18 @@ class InstructionStorageBlockEntity(
             val output = InstructionSet.getOutput(stack)
             val alias = stack.hoverName.string.takeIf { it != "Instruction Set" }
             val subs = InstructionSet.getSubstitutions(stack)
-            result.add(InstructionSetInfo(recipe, output, alias, i, subs))
+            result.add(InstructionSetInfo(
+                recipe, output, alias, i, subs, InstructionSet.getOutputStack(stack).componentsPatch,
+                ingredients = InstructionSet.getRecipeStacks(stack),
+                outputKnown = stack.has(damien.nodeworks.registry.ModDataComponents.INSTRUCTION_SET_OUTPUT),
+            ))
         }
         return result
+    }
+
+    override fun setChanged() {
+        instructionSetsCache = null
+        super.setChanged()
     }
 
     /** All Instruction Sets from this block plus every face-adjacent InstructionStorage in the cluster. */
@@ -106,6 +128,14 @@ class InstructionStorageBlockEntity(
          *  `Ingredient` predicate and may swap exemplar items for any acceptable
          *  alternative the network has in stock. */
         val allowSubstitutions: Boolean = true,
+        /** Components of the recipe's result, empty for plain outputs and older cards. */
+        val outputComponents: net.minecraft.core.component.DataComponentPatch = net.minecraft.core.component.DataComponentPatch.EMPTY,
+        /** The grid as stacks, parallel to [recipe]. A slot kept with components is that
+         *  variant, every other slot is the plain item of its id. */
+        val ingredients: List<net.minecraft.world.item.ItemStack> = emptyList(),
+        /** False for a card saved before its output stack was stored. [outputComponents]
+         *  is then empty whatever the recipe really makes. */
+        val outputKnown: Boolean = true,
     )
 
     // --- Connectable ---
@@ -152,11 +182,13 @@ class InstructionStorageBlockEntity(
             // Deferring via the revalidation queue (instead of propagating now)
             // avoids traversing this about-to-be-removed position as a cluster
             // neighbor.
-            for (dir in Direction.entries) {
-                val neighbor = worldPosition.relative(dir)
-                if (lvl.isLoaded(neighbor) && lvl.getBlockEntity(neighbor) is InstructionStorageBlockEntity) {
-                    NodeConnectionHelper.queueRevalidation(lvl, neighbor)
-                }
+            // A broken member may have cut the cluster, so each sibling's walk must still
+            // reach every other to keep an id from before. An unload names nothing.
+            val siblings = Direction.entries.map { worldPosition.relative(it) }
+                .filter { lvl.isLoaded(it) && lvl.getBlockEntity(it) is InstructionStorageBlockEntity }
+            val joined = if (blockDestroyed) siblings else emptyList()
+            for (neighbor in siblings) {
+                NodeConnectionHelper.queueRevalidation(lvl, neighbor, joined)
             }
         }
         super.setRemoved()
@@ -184,6 +216,7 @@ class InstructionStorageBlockEntity(
     }
 
     override fun removeItemNoUpdate(slot: Int): ItemStack {
+        instructionSetsCache = null
         return ContainerHelper.takeItem(items, slot)
     }
 
@@ -201,6 +234,7 @@ class InstructionStorageBlockEntity(
 
     override fun clearContent() {
         items.clear()
+        instructionSetsCache = null
     }
 
     // --- Serialization ---
@@ -216,10 +250,11 @@ class InstructionStorageBlockEntity(
         super.loadAdditional(input)
         items.clear()
         ContainerHelper.loadAllItems(input, items)
+        instructionSetsCache = null
         networkId = input.getStringOrNull("networkId")?.takeIf { it.isNotEmpty() }?.let {
             try { UUID.fromString(it) } catch (_: Exception) { null }
         }
-        damien.nodeworks.network.NetworkSettingsRegistry.notifyConnectableChanged(networkId)
+        if (level != null) damien.nodeworks.network.NetworkSettingsRegistry.notifyBlockSynced(worldPosition)
         connections.clear()
         connections.addAll(input.getBlockPosList("connections"))
     }

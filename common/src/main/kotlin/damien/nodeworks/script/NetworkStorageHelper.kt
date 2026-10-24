@@ -5,6 +5,7 @@ import damien.nodeworks.network.CardSnapshot
 import damien.nodeworks.network.ChannelFilter
 import damien.nodeworks.network.NetworkSnapshot
 import damien.nodeworks.platform.FluidInfo
+import damien.nodeworks.platform.MoveDeadline
 import damien.nodeworks.platform.FluidStorageHandle
 import damien.nodeworks.platform.ItemInfo
 import damien.nodeworks.platform.ItemStorageHandle
@@ -22,14 +23,11 @@ object NetworkStorageHelper {
 
     fun getStorageCards(snapshot: NetworkSnapshot): List<CardSnapshot> = snapshot.storageCards
 
-    /**
-     * Storage cards are fluid-first: if the adjacent block exposes a fluid capability,
-     * item I/O is disabled on that card. This keeps the Inventory Terminal from mixing
-     * item and fluid totals on hybrid blocks that expose both caps.
-     */
+    /** Item view of the block a Storage Card faces. Hybrid blocks that also hold
+     *  fluids (casting tables, smelteries, ME networks) stay visible here, the
+     *  fluid side is read separately through [getFluidStorage]. */
     fun getStorage(level: ServerLevel, card: CardSnapshot): ItemStorageHandle? {
         val cap = card.capability as? StorageSideCapability ?: return null
-        if (PlatformServices.storage.getFluidStorage(level, cap.adjacentPos, cap.defaultFace) != null) return null
         return PlatformServices.storage.getItemStorage(level, cap.adjacentPos, cap.defaultFace)
     }
 
@@ -65,6 +63,54 @@ object NetworkStorageHelper {
         }
         return total
     }
+
+    /** Items across the network that pass [predicate], which sees the real stack. */
+    fun countItems(
+        level: ServerLevel,
+        snapshot: NetworkSnapshot,
+        predicate: (net.minecraft.world.item.ItemStack) -> Boolean,
+        channel: ChannelFilter = ChannelFilter.All,
+    ): Long {
+        var total = 0L
+        val visited = HashSet<BlockPos>()
+        for (card in getStorageCards(snapshot)) {
+            if (!channel.matches(card.channel)) continue
+            val cap = card.capability as? StorageSideCapability ?: continue
+            if (!visited.add(cap.adjacentPos)) continue
+            val storage = getStorage(level, card) ?: continue
+            total += PlatformServices.storage.countStacksByPredicate(storage, predicate)
+        }
+        return total
+    }
+
+    fun countItemsInt(
+        level: ServerLevel,
+        snapshot: NetworkSnapshot,
+        predicate: (net.minecraft.world.item.ItemStack) -> Boolean,
+        channel: ChannelFilter = ChannelFilter.All,
+    ): Int = countItems(level, snapshot, predicate, channel)
+        .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+
+    /** Int-saturating [countItems]. Modded storage can report counts past
+     *  Int.MAX_VALUE and a raw toInt() wraps, reading huge stock as none
+     *  (#68). Floors at 0 in case the Long sum itself overflowed. */
+    fun countItemsInt(
+        level: ServerLevel,
+        snapshot: NetworkSnapshot,
+        filter: String,
+        channel: ChannelFilter = ChannelFilter.All,
+    ): Int = countItems(level, snapshot, filter, channel)
+        .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+
+    /** Int-saturating [countVariantAcrossNetwork], same rationale as [countItemsInt]. */
+    fun countVariantAcrossNetworkInt(
+        level: ServerLevel,
+        snapshot: NetworkSnapshot,
+        itemId: String,
+        componentsPatch: net.minecraft.core.component.DataComponentPatch,
+        channel: ChannelFilter = ChannelFilter.All,
+    ): Int = countVariantAcrossNetwork(level, snapshot, itemId, componentsPatch, channel)
+        .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
 
     /** Count items across the network whose itemId AND DataComponents match
      *  the target variant. Used by the planner's component-aware
@@ -236,6 +282,7 @@ object NetworkStorageHelper {
             if (!channel.matches(card.channel)) continue
             val storage = getFluidStorage(level, card) ?: continue
             val inserted = PlatformServices.storage.insertFluid(storage, fluidId, remaining)
+            if (inserted > 0L) cache?.onChannelFluidDelta(card.channel, fluidId, inserted)
             remaining -= inserted
         }
         val placed = amount - remaining
@@ -269,6 +316,7 @@ object NetworkStorageHelper {
         routeTable: RouteTable? = null,
         cache: NetworkInventoryCache? = null,
         channel: ChannelFilter = ChannelFilter.All,
+        onFail: ((reason: String, msg: String) -> Unit)? = null,
     ): Boolean {
         if (requested <= 0L) return true
 
@@ -285,7 +333,10 @@ object NetworkStorageHelper {
                 remainingDemand -= take
             }
         }
-        if (remainingDemand > 0L) return false
+        if (remainingDemand > 0L) {
+            onFail?.invoke("source", "network:insert moved nothing: only ${requested - remainingDemand} of the $requested items are in the source.")
+            return false
+        }
 
         // Capacity probe, per item type. Each type checks independently against the full
         // network, a storage card's free slots are consumed by the first type we probe,
@@ -305,7 +356,10 @@ object NetworkStorageHelper {
                     PlatformServices.storage.simulateInsertItem(dest, item, need - capacity)
                 } catch (_: Exception) { 0L }
             }
-            if (capacity < need) return false
+            if (capacity < need) {
+                onFail?.invoke("space", "network:insert moved nothing: not enough space for $itemId, only $capacity of $need fit.")
+                return false
+            }
         }
 
         // Sim said it fits, commit. Under single-threaded server execution this should
@@ -313,8 +367,12 @@ object NetworkStorageHelper {
         // vanilla IItemHandler but defensive for modded storages), we treat the shortfall
         // as a hard failure and unwind by reverse-moving the committed items back to
         // source. This keeps the atomic contract even on pathological edge cases.
-        val moved = insertItems(level, snapshot, source, filter, requested, routeTable, null, cache, channel)
+        // Atomic, so never cut short by a deadline from the caller.
+        val moved = MoveDeadline.suspended {
+            insertItems(level, snapshot, source, filter, requested, routeTable, null, cache, channel)
+        }
         if (moved == requested) return true
+        onFail?.invoke("refused", "network:insert moved nothing: the network refused some of the items.")
 
         // Unexpected shortfall, unwind. Since source was just drained of at most `moved`
         // items of types we tracked in `demand`, it necessarily has slot capacity for them
@@ -537,8 +595,19 @@ object NetworkStorageHelper {
         stack: net.minecraft.world.item.ItemStack,
         cache: NetworkInventoryCache? = null,
         channel: ChannelFilter = ChannelFilter.All,
+        /** Storage Cards facing any of these positions are skipped, so a device feeding
+         *  the network from an inventory never puts items back into it, or into another
+         *  inventory the caller has reasons to keep out of the move. */
+        exclude: Set<BlockPos> = emptySet(),
+        /** Told each card that took part of the stack, so a caller that inserts often can
+         *  come back to the same card without the walk. */
+        onPlaced: ((CardSnapshot) -> Unit)? = null,
     ): Int {
         var remaining = stack.count
+        // Every insert keeps the cache current. A caller without a cache in hand, the CPU
+        // flush at the end of a craft among them, would otherwise leave the grid and the
+        // craft queue reservations lagging behind storage until the next poll.
+        val cache = cache ?: NetworkInventoryCache.existing(snapshot.networkId)
         val itemId = damien.nodeworks.platform.ItemIdCache.get(stack.item)
         // ItemStack carries its own NBT-presence state, so the filter check
         // can use the actual `hasData` rather than guessing.
@@ -548,9 +617,12 @@ object NetworkStorageHelper {
             if (remaining <= 0) break
             if (!channel.matches(card.channel)) continue
             val cap = card.capability as? damien.nodeworks.card.StorageSideCapability
+            if (exclude.isNotEmpty() && cap != null && cap.adjacentPos in exclude) continue
             if (cap != null && !cap.acceptsItem(stack, registries)) continue
             val storage = getStorage(level, card) ?: continue
             val inserted = PlatformServices.storage.insertItemStack(storage, stack.copyWithCount(remaining))
+            if (inserted > 0 && itemId != null) cache?.onChannelDelta(card.channel, itemId, stack.componentsPatch, inserted.toLong())
+            if (inserted > 0) onPlaced?.invoke(card)
             remaining -= inserted
         }
         val totalInserted = stack.count - remaining
@@ -576,12 +648,15 @@ object NetworkStorageHelper {
         onInsertCallback: ((String, Long) -> ItemStorageHandle?)? = null,
         cache: NetworkInventoryCache? = null,
         channel: ChannelFilter = ChannelFilter.All,
+        /** A check on the real stack on top of [filter], for callers whose rules see
+         *  components, so a potion rule moves only that potion. */
+        stackPred: ((net.minecraft.world.item.ItemStack) -> Boolean)? = null,
     ): Long {
         if (routeTable == null && onInsertCallback == null) {
             // No routing, fast path, use all storages
-            return insertItemsDefault(level, snapshot, source, filter, maxCount, cache, channel)
+            return insertItemsDefault(level, snapshot, source, filter, maxCount, cache, channel, stackPred)
         }
-        return insertItemsRouted(level, snapshot, source, filter, maxCount, routeTable, onInsertCallback, cache, channel)
+        return insertItemsRouted(level, snapshot, source, filter, maxCount, routeTable, onInsertCallback, cache, channel, stackPred)
     }
 
     /**
@@ -598,6 +673,7 @@ object NetworkStorageHelper {
         onInsertCallback: ((String, Long) -> ItemStorageHandle?)?,
         cache: NetworkInventoryCache? = null,
         channel: ChannelFilter = ChannelFilter.All,
+        stackPred: ((net.minecraft.world.item.ItemStack) -> Boolean)? = null,
     ): Long {
         var totalMoved = 0L
         var remaining = maxCount
@@ -606,30 +682,24 @@ object NetworkStorageHelper {
         // are processed independently.
         val processedVariants = mutableSetOf<damien.nodeworks.script.BufferKey.Key>()
 
-        while (remaining > 0) {
-            val itemInfo = PlatformServices.storage.findFirstItemInfo(source) {
-                CardHandle.matchesFilter(it, filter)
-            }?.takeIf {
-                damien.nodeworks.script.BufferKey.Key(
-                    it.itemId, damien.nodeworks.script.BufferKey.componentsHash(it.componentsPatch),
-                ) !in processedVariants
-            } ?: run {
-                // findFirstItemInfo only returns the first match; scan for the
-                // next unprocessed variant once that one's done.
-                PlatformServices.storage.findAllItemInfo(source) { CardHandle.matchesFilter(it, filter) }
-                    .firstOrNull {
-                        damien.nodeworks.script.BufferKey.Key(
-                            it.itemId, damien.nodeworks.script.BufferKey.componentsHash(it.componentsPatch),
-                        ) !in processedVariants
-                    }
-            } ?: break
+        // One scan up front, an ME source can hold thousands of types.
+        val variants = PlatformServices.storage.findAllItemInfo(source) { CardHandle.matchesFilter(it, filter) }
+        for (itemInfo in variants) {
+            if (remaining <= 0 || MoveDeadline.expired()) break
             val itemId = itemInfo.itemId
             val hasData = itemInfo.hasData
             val componentsPatch = itemInfo.componentsPatch
             val wantHash = damien.nodeworks.script.BufferKey.componentsHash(componentsPatch)
             val variantKey = damien.nodeworks.script.BufferKey.Key(itemId, wantHash)
 
-            processedVariants.add(variantKey)
+            if (!processedVariants.add(variantKey)) continue
+            if (stackPred != null) {
+                // One representative stack per variant decides for the whole variant.
+                val item = net.minecraft.resources.Identifier.tryParse(itemId)
+                    ?.let { BuiltInRegistries.ITEM.getValue(it) } ?: continue
+                val representative = net.minecraft.world.item.ItemStack(item).also { it.applyComponents(componentsPatch) }
+                if (!stackPred(representative)) continue
+            }
 
             // Matches only this exact variant.
             val variantPred: (net.minecraft.world.item.ItemStack) -> Boolean = { stack ->
@@ -687,7 +757,7 @@ object NetworkStorageHelper {
                     val fallbackMoved = if (routeTable != null) {
                         routeTable.insertDefault(source, itemId, toMove - moved)
                     } else {
-                        insertItemsDefault(level, snapshot, source, itemId, toMove - moved, cache, channel)
+                        insertItemsDefault(level, snapshot, source, itemId, toMove - moved, cache, channel, stackPred)
                     }
                     if (fallbackMoved > 0) cache?.onInserted(itemId, hasData, fallbackMoved, componentsPatch)
                     totalMoved += fallbackMoved
@@ -700,7 +770,7 @@ object NetworkStorageHelper {
             val defaultMoved = if (routeTable != null) {
                 routeTable.insertDefault(source, itemId, toMove)
             } else {
-                insertItemsDefault(level, snapshot, source, itemId, toMove, cache, channel)
+                insertItemsDefault(level, snapshot, source, itemId, toMove, cache, channel, stackPred)
             }
             if (defaultMoved > 0) cache?.onInserted(itemId, hasData, defaultMoved, componentsPatch)
             totalMoved += defaultMoved
@@ -711,8 +781,8 @@ object NetworkStorageHelper {
     }
 
     /** Default priority-based routing across ALL storage cards (no route filtering).
-     *  Enumerates source variants so each card's component-aware acceptance
-     *  rule is applied per variant, not collapsed by itemId. */
+     *  Walks the destination cards in priority order and asks each for everything it
+     *  accepts in one move, so the source is never listed in full. */
     private fun insertItemsDefault(
         level: ServerLevel,
         snapshot: NetworkSnapshot,
@@ -721,35 +791,26 @@ object NetworkStorageHelper {
         maxCount: Long,
         cache: NetworkInventoryCache? = null,
         channel: ChannelFilter = ChannelFilter.All,
+        stackPred: ((net.minecraft.world.item.ItemStack) -> Boolean)? = null,
     ): Long {
         var totalMoved = 0L
         var remaining = maxCount
         val registries = level.registryAccess()
-        val variants = PlatformServices.storage.findAllItemInfo(source) {
-            CardHandle.matchesFilter(it, filter)
-        }
-        for (info in variants) {
-            if (remaining <= 0L) break
-            val itemId = info.itemId
-            val componentsPatch = info.componentsPatch
-            val wantHash = damien.nodeworks.script.BufferKey.componentsHash(componentsPatch)
-            // Matches only this exact variant.
-            val variantPred: (net.minecraft.world.item.ItemStack) -> Boolean = { stack ->
-                val sid = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.item)?.toString()
-                sid == itemId && damien.nodeworks.script.BufferKey.componentsHash(stack) == wantHash
+        for (card in getStorageCards(snapshot)) {
+            if (remaining <= 0L || MoveDeadline.expired()) break
+            if (!channel.matches(card.channel)) continue
+            val destStorage = getStorage(level, card) ?: continue
+            val cap = card.capability as? damien.nodeworks.card.StorageSideCapability
+            val accepts: (net.minecraft.world.item.ItemStack) -> Boolean = { stack ->
+                CardHandle.matchesFilter(BuiltInRegistries.ITEM.getKey(stack.item).toString(), filter) &&
+                    (stackPred == null || stackPred(stack)) &&
+                    (cap == null || cap.acceptsItem(stack, registries))
             }
-            for (card in getStorageCards(snapshot)) {
-                if (remaining <= 0L) break
-                if (!channel.matches(card.channel)) continue
-                val cap = card.capability as? damien.nodeworks.card.StorageSideCapability
-                if (cap != null && !cap.acceptsItem(itemId, componentsPatch, registries)) continue
-                val destStorage = getStorage(level, card) ?: continue
-                val moved = try {
-                    PlatformServices.storage.moveItemsByStackPredicate(source, destStorage, variantPred, remaining)
-                } catch (_: Exception) { 0L }
-                totalMoved += moved
-                remaining -= moved
-            }
+            val moved = try {
+                PlatformServices.storage.moveItemsByStackPredicate(source, destStorage, accepts, remaining)
+            } catch (_: Exception) { 0L }
+            totalMoved += moved
+            remaining -= moved
         }
         // Cache notification handled by callers in [insertItemsRouted] so we
         // don't double-count here. [insertItems]'s direct default path passes

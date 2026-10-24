@@ -2,6 +2,7 @@ package damien.nodeworks.block
 
 import com.mojang.serialization.MapCodec
 import damien.nodeworks.block.entity.CpuComponentBlockEntity
+import damien.nodeworks.block.entity.CraftingCoreBlockEntity
 import damien.nodeworks.block.entity.CraftingStorageBlockEntity
 import net.minecraft.core.BlockPos
 import net.minecraft.core.particles.ParticleTypes
@@ -54,8 +55,19 @@ class CraftingStorageBlock(properties: Properties) : BaseEntityBlock(properties)
         return CraftingStorageBlockEntity(pos, state)
     }
 
+    override fun affectNeighborsAfterRemoval(state: BlockState, level: net.minecraft.server.level.ServerLevel, pos: BlockPos, movedByPiston: Boolean) {
+        super.affectNeighborsAfterRemoval(state, level, pos, movedByPiston)
+        CpuComponentBlockEntity.requestRescanOnRemove(level, pos)
+    }
+
+    override fun onPlace(state: BlockState, level: Level, pos: BlockPos, oldState: BlockState, movedByPiston: Boolean) {
+        super.onPlace(state, level, pos, oldState, movedByPiston)
+        CpuComponentBlockEntity.requestRescanOnPlace(level, pos, state, oldState)
+    }
+
     override fun neighborChanged(state: BlockState, level: Level, pos: BlockPos, neighborBlock: Block, orientation: net.minecraft.world.level.redstone.Orientation?, movedByPiston: Boolean) {
         super.neighborChanged(state, level, pos, neighborBlock, orientation, movedByPiston)
+        if (CraftingCoreBlockEntity.pushingStates) return
         level.getBlockEntity(pos) as? CraftingStorageBlockEntity ?: return
         val cores = CpuComponentBlockEntity.findConnectedCores(level, pos)
         if (cores.isEmpty()) {
@@ -65,7 +77,7 @@ class CraftingStorageBlock(properties: Properties) : BaseEntityBlock(properties)
             if (next.getValue(OVERHEAT_LEVEL) != 0) next = next.setValue(OVERHEAT_LEVEL, 0)
             if (next !== state) level.setBlock(pos, next, Block.UPDATE_ALL)
         } else {
-            cores.forEach { it.recalculateCapacity() }
+            cores.forEach { it.requestRecalculate() }
         }
     }
 
@@ -90,7 +102,7 @@ class CraftingStorageBlock(properties: Properties) : BaseEntityBlock(properties)
 
     override fun playerWillDestroy(level: Level, pos: BlockPos, state: BlockState, player: Player): BlockState {
         if (!level.isClientSide) {
-            CpuComponentBlockEntity.findConnectedCores(level, pos).forEach { it.recalculateCapacity() }
+            CpuComponentBlockEntity.findConnectedCores(level, pos).forEach { it.requestRecalculate() }
         }
         return super.playerWillDestroy(level, pos, state, player)
     }

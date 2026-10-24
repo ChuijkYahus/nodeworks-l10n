@@ -59,8 +59,8 @@ class InventoryTerminalScreen(
 
     enum class Layout(val cols: Int, val rows: Int, val icon: Icons) {
         SMALL(9, 5, Icons.LAYOUT_SMALL),
-        WIDE(9, 7, Icons.LAYOUT_WIDE),
-        TALL(13, 5, Icons.LAYOUT_TALL),
+        WIDE(13, 5, Icons.LAYOUT_WIDE),
+        TALL(9, 7, Icons.LAYOUT_TALL),
         LARGE(13, 7, Icons.LAYOUT_LARGE);
 
         companion object {
@@ -149,6 +149,7 @@ class InventoryTerminalScreen(
     private var lastAttemptItemId: String? = null
     private var lastAttemptItemName: String = ""
     private var lastAttemptCount: Int = 1
+    private var lastAttemptComponentsPatch: DataComponentPatch = DataComponentPatch.EMPTY
 
     /** Absolute ms deadline after which the dialog auto-closes (treating no error
      *  arriving as success). 0 = no pending close scheduled. */
@@ -162,6 +163,7 @@ class InventoryTerminalScreen(
         if (craftDialogueItemId == null && lastAttemptItemId != null) {
             craftDialogueItemId = lastAttemptItemId
             craftDialogueItemName = lastAttemptItemName
+            craftDialogueComponentsPatch = lastAttemptComponentsPatch
             craftDialogueField?.value = lastAttemptCount.toString()
             craftDialogueField?.visible = true
         }
@@ -187,8 +189,35 @@ class InventoryTerminalScreen(
      *  detect changes typed in JEI while the terminal is open. */
     private var lastJeiSeenText: String = ""
 
+    private var channelPicker: damien.nodeworks.screen.widget.ChannelPickerWidget? = null
+    /** The server said which network this is, restore the channel saved for it. */
+    fun onNetworkSynced() {
+        val id = menu.networkId ?: return
+        val saved = damien.nodeworks.network.ChannelFilter.fromNbtInt(ClientConfig.invTerminalChannel(id.toString()))
+        if (saved == menu.channel) return
+        showChannel(saved)
+        when (saved) {
+            damien.nodeworks.network.ChannelFilter.All -> channelPicker?.setNone()
+            is damien.nodeworks.network.ChannelFilter.Color -> channelPicker?.setColor(saved.color)
+        }
+    }
+
+    private fun showChannel(filter: damien.nodeworks.network.ChannelFilter) {
+        menu.channel = filter
+        scrollOffset = 0
+        PlatformServices.clientNetworking.sendToServer(
+            damien.nodeworks.network.InvTerminalSetChannelPayload(menu.containerId, filter.toNbtInt())
+        )
+    }
+
+    private var channelBtnX = 0
+    private var channelBtnY = 0
     private var cachedNetworkColor: Int? = null
-    private var itemStackCache = HashMap<String, ItemStack>()
+    /** A display stack per variant. Keyed by the patch itself, not its Java hash: two
+     *  variants that differ only in small integer values can share a hash, and a hash key
+     *  then showed one row with the other's icon and tooltip. Equality tells them apart. */
+    private data class DisplayStackKey(val itemId: String, val patch: DataComponentPatch)
+    private var itemStackCache = HashMap<DisplayStackKey, ItemStack>()
     // Reused container for JEI hoveredSlot, avoids allocating new SimpleContainer every frame
     private val hoverContainer = net.minecraft.world.SimpleContainer(1)
 
@@ -223,6 +252,9 @@ class InventoryTerminalScreen(
 
     override fun init() {
         super.init()
+        // The client menu predicts auto-pull refills, so it needs the same flag the
+        // server is told about.
+        menu.autoPull = ClientConfig.invTerminalAutoPull
         // JEI's recipe view overlays this screen via setScreen, so the
         // recipe-transfer handler can't reach the live terminal through
         // `Minecraft.getInstance().screen` and reads through here instead.
@@ -421,6 +453,27 @@ class InventoryTerminalScreen(
             }
             rebuildWidgets()
         })
+        sideBtnY += SIDE_BTN_W + SIDE_BTN_GAP
+
+        // Channel filter. The "none" cell means all channels, the default on open.
+        channelBtnX = sideBtnX
+        channelBtnY = sideBtnY
+        val shown = menu.channel
+        channelPicker = damien.nodeworks.screen.widget.ChannelPickerWidget(
+            sideBtnX + (SIDE_BTN_W - damien.nodeworks.screen.widget.ChannelPickerWidget.SWATCH) / 2,
+            sideBtnY + (SIDE_BTN_W - damien.nodeworks.screen.widget.ChannelPickerWidget.SWATCH) / 2,
+            initialColor = (shown as? damien.nodeworks.network.ChannelFilter.Color)?.color ?: net.minecraft.world.item.DyeColor.WHITE,
+            canBeNone = true,
+            initialIsNone = shown == damien.nodeworks.network.ChannelFilter.All,
+            tooltipPrefix = "Show items from",
+        ) { color ->
+            val filter = if (color == null) damien.nodeworks.network.ChannelFilter.All
+                else damien.nodeworks.network.ChannelFilter.Color(color)
+            showChannel(filter)
+            menu.networkId?.let { ClientConfig.setInvTerminalChannel(it.toString(), filter.toNbtInt()) }
+        }.also { addRenderableWidget(it) }
+        // The network can be known before the screen opened, restore its channel now.
+        onNetworkSynced()
 
         // Crafting grid utility buttons (left of 3x3 grid, only when expanded)
         if (!craftingCollapsed) {
@@ -446,6 +499,7 @@ class InventoryTerminalScreen(
             val autoPullIcon = if (ClientConfig.invTerminalAutoPull) Icons.AUTO_PULL_ON else Icons.AUTO_PULL_OFF
             addRenderableWidget(SlicedButton.create(ubX, craftY + 37, ubW, ubH, "", autoPullIcon) { _ ->
                 ClientConfig.invTerminalAutoPull = !ClientConfig.invTerminalAutoPull
+                menu.autoPull = ClientConfig.invTerminalAutoPull
                 PlatformServices.clientNetworking.sendToServer(
                     damien.nodeworks.network.InvTerminalCraftGridActionPayload(menu.containerId, 2)
                 )
@@ -502,6 +556,15 @@ class InventoryTerminalScreen(
             } else -1
             NineSlice.drawTitleBar(graphics, font, title, leftPos, topPos, imageWidth, TOP_BAR_H, networkColor)
         }
+
+        // Button frame behind the channel swatch, matching the other side buttons.
+        val hovered = mouseX in channelBtnX until channelBtnX + SIDE_BTN_W && mouseY in channelBtnY until channelBtnY + SIDE_BTN_W
+        val btn = when {
+            channelPicker?.expanded == true -> NineSlice.BUTTON_ACTIVE
+            hovered -> NineSlice.BUTTON_HOVER
+            else -> NineSlice.BUTTON
+        }
+        btn.draw(graphics, channelBtnX, channelBtnY, SIDE_BTN_W, SIDE_BTN_W)
 
         // Network item grid background
         networkGrid.renderBackground(graphics)
@@ -686,6 +749,7 @@ class InventoryTerminalScreen(
             if (!stack.isEmpty) {
                 if (slot.availableCount <= 0) {
                     // Pending: gray overlay + dim item + queued count in gray (0.5x scale)
+                    damien.nodeworks.compat.ItemBordersCompat.renderBorder(graphics, stack, sx, pinnedY)
                     graphics.renderItem(stack, sx, pinnedY)
                     graphics.fill(sx, pinnedY, sx + 16, pinnedY + 16, 0x80000000.toInt())
                     graphics.pose().pushMatrix()
@@ -704,6 +768,7 @@ class InventoryTerminalScreen(
                     graphics.pose().popMatrix()
                 } else {
                     // Items available, render normally with available count (0.5x scale)
+                    damien.nodeworks.compat.ItemBordersCompat.renderBorder(graphics, stack, sx, pinnedY)
                     graphics.renderItem(stack, sx, pinnedY)
                     if (slot.availableCount > 1) {
                         val countStr = formatCount(slot.availableCount.toLong())
@@ -770,11 +835,16 @@ class InventoryTerminalScreen(
             if (entry.info.isCraftable) {
                 val ix = slot.x + 1
                 val iy = slot.y + 1
+                val warned = entry.info.craftWarning != damien.nodeworks.platform.CraftWarning.NONE
                 if (entry.info.count == 0L) {
-                    // Ghost item, dim overlay
-                    graphics.fill(ix, iy, ix + 16, iy + 16, 0x80000000.toInt())
+                    // Ghost item, dim overlay. Red when it cannot be crafted either.
+                    graphics.fill(ix, iy, ix + 16, iy + 16, if (warned) 0x80600000.toInt() else 0x80000000.toInt())
                 }
-                if (altHeld) {
+                if (warned) {
+                    // The glyph sits in the middle of its cell, shifted so it lands on the
+                    // item's top right corner where the craft + would go.
+                    Icons.WARNING.draw(graphics, ix + 4, iy - 3)
+                } else if (altHeld) {
                     // Show + icon on craftable items (above item Z layer)
                     graphics.pose().pushMatrix()
                     graphics.pose().translate((0f).toFloat(), (0f).toFloat())
@@ -838,16 +908,15 @@ class InventoryTerminalScreen(
                 }
             }
         } else if (menu.hasCrystalSlot && isCrystalSlotAt(mouseX, mouseY)) {
-            // Crystal slot, MC real slot, pointable directly.
-            hoveredSlot = menu.slots[InventoryTerminalMenu.CRYSTAL_SLOT]
+            hoveredSlot = jeiSlotFor(menu.slots[InventoryTerminalMenu.CRYSTAL_SLOT], crystalSlotX + 1, crystalSlotY + 1)
         } else {
             // Check crafting grid
             val craftSlot = getCraftSlotAt(mouseX, mouseY)
             if (craftSlot >= 0) {
                 val slot = menu.slots[InventoryTerminalMenu.CRAFT_INPUT_START + craftSlot]
-                hoveredSlot = slot
+                hoveredSlot = jeiSlotFor(slot, craftX + (craftSlot % 3) * 18 + 1, craftY + (craftSlot / 3) * 18 + 1)
             } else if (isCraftOutputAt(mouseX, mouseY)) {
-                hoveredSlot = menu.slots[InventoryTerminalMenu.CRAFT_OUTPUT_SLOT]
+                hoveredSlot = jeiSlotFor(menu.slots[InventoryTerminalMenu.CRAFT_OUTPUT_SLOT], craftX + 3 * 18 + 16 + 1, craftY + 18 + 1)
             } else {
                 // Check player inventory
                 val mainSlot = playerMainGrid.getSlotAt(mouseX, mouseY)
@@ -874,11 +943,12 @@ class InventoryTerminalScreen(
         playerHotbarGrid.renderHoverHighlight(graphics, mouseX, mouseY)
 
         // Left-drag preview: show distributed items
-        if (slotDragButton == 0 && !slotDragShift && slotDragVisited.size > 1 && !slotDragStack.isEmpty) {
+        val previewTargets = if (slotDragButton == 0 && !slotDragShift && slotDragVisited.size > 1) dragTargets() else emptyList()
+        if (previewTargets.isNotEmpty() && !slotDragStack.isEmpty) {
             val total = slotDragStack.count
-            val perSlot = total / slotDragVisited.size
-            val remainder = total % slotDragVisited.size
-            for ((idx, ref) in slotDragVisited.withIndex()) {
+            val perSlot = total / previewTargets.size
+            val remainder = total % previewTargets.size
+            for ((idx, ref) in previewTargets.withIndex()) {
                 val amount = perSlot + if (idx < remainder) 1 else 0
                 if (amount <= 0) continue
                 val previewStack = slotDragStack.copyWithCount(amount)
@@ -929,7 +999,8 @@ class InventoryTerminalScreen(
             val queueIdx = hoveredNetwork!!.index % layout.cols
             if (queueIdx < craftQueue.size) {
                 val slot = craftQueue[queueIdx]
-                val stack = getItemStack(slot.itemId)
+                // The variant being crafted, so the tooltip names the potion or tier.
+                val stack = getItemStack(slot.itemId, slot.componentsPatch)
                 if (!stack.isEmpty) {
                     val lines = getTooltipFromItem(Minecraft.getInstance(), stack).toMutableList()
                     val statusStr = if (slot.isComplete) "Complete" else "Crafting..."
@@ -958,6 +1029,9 @@ class InventoryTerminalScreen(
                         lines.add(Component.literal("Network: ${formatCount(entry.info.count)}").withStyle { it.withColor(0xAAAAAA) })
                         if (entry.info.isCraftable) {
                             lines.add(Component.literal("Craftable").withStyle { it.withColor(0x55FF55) })
+                            damien.nodeworks.platform.CraftWarning.message(entry.info.craftWarning)?.let { reason ->
+                                lines.add(Component.literal(reason).withStyle { it.withColor(0xFF5555) })
+                            }
                         }
                         graphics.setTooltipForNextFrame(font, lines, java.util.Optional.empty(), mouseX, mouseY)
                     }
@@ -1110,6 +1184,8 @@ class InventoryTerminalScreen(
             graphics.pose().popMatrix()
         }
 
+        if (craftDialogueItemId == null) channelPicker?.renderOverlay(graphics, mouseX, mouseY)
+
         // Render carried item on cursor
         val carried = menu.carried
         if (!carried.isEmpty) {
@@ -1129,6 +1205,9 @@ class InventoryTerminalScreen(
     // ========== Input ==========
 
     override fun mouseClicked(event: MouseButtonEvent, doubleClick: Boolean): Boolean {
+        // An open channel popup takes the click before anything under it.
+        val picker = channelPicker
+        if (picker != null && picker.expanded && picker.handleOverlayClick(event.mouseX, event.mouseY)) return true
         val mouseX = event.mouseX
         val mouseY = event.mouseY
         val button = event.buttonNum
@@ -1174,6 +1253,7 @@ class InventoryTerminalScreen(
                 if (count > 0) {
                     lastAttemptItemId = craftDialogueItemId
                     lastAttemptItemName = craftDialogueItemName
+                    lastAttemptComponentsPatch = craftDialogueComponentsPatch
                     lastAttemptCount = count
                     PlatformServices.clientNetworking.sendToServer(
                         damien.nodeworks.network.InvTerminalCraftPayload(menu.containerId, craftDialogueItemId!!, count, craftDialogueComponentsPatch)
@@ -1265,6 +1345,19 @@ class InventoryTerminalScreen(
             return false
         }
 
+        // Same slot twice inside the double-click window, regardless of cursor
+        // contents. Shift paths need this since a shift-click leaves the cursor empty.
+        fun isRepeatClick(slotType: Int, slotIndex: Int): Boolean {
+            val repeat = button == 0
+                && now - lastClickTime < 400
+                && lastClickSlotType == slotType
+                && lastClickSlotIndex == slotIndex
+            lastClickTime = if (repeat) 0 else now
+            lastClickSlotType = slotType
+            lastClickSlotIndex = slotIndex
+            return repeat
+        }
+
         // Crafting grid click
         if (!craftingCollapsed) {
             val craftSlot = getCraftSlotAt(mx, my)
@@ -1284,6 +1377,7 @@ class InventoryTerminalScreen(
                     slotDragShift = true
                     slotDragVisited.clear()
                     slotDragVisited.add(DragSlotRef(0, slotIdx))
+                    slotDragLastHovered = DragSlotRef(0, slotIdx)
                 } else if (!menu.carried.isEmpty && button == 1) {
                     // Right-click: place one item, start right-drag
                     slotClicked(menu.slots[slotIdx], slotIdx, 1, net.minecraft.world.inventory.ContainerInput.PICKUP)
@@ -1306,8 +1400,11 @@ class InventoryTerminalScreen(
             }
             // Output slot
             if (isCraftOutputAt(mx, my)) {
-                val clickType = if (hasShiftDownCompat()) net.minecraft.world.inventory.ContainerInput.QUICK_MOVE else net.minecraft.world.inventory.ContainerInput.PICKUP
-                slotClicked(menu.slots[InventoryTerminalMenu.CRAFT_OUTPUT_SLOT], InventoryTerminalMenu.CRAFT_OUTPUT_SLOT, button, clickType)
+                val shift = hasShiftDownCompat()
+                val clickType = if (shift) net.minecraft.world.inventory.ContainerInput.QUICK_MOVE else net.minecraft.world.inventory.ContainerInput.PICKUP
+                // Shift crafts one stack, Ctrl+Shift crafts as many as fit.
+                val clickButton = if (shift && hasControlDownCompat()) InventoryTerminalMenu.CRAFT_ALL_BUTTON else button
+                slotClicked(menu.slots[InventoryTerminalMenu.CRAFT_OUTPUT_SLOT], InventoryTerminalMenu.CRAFT_OUTPUT_SLOT, clickButton, clickType)
                 return true
             }
         }
@@ -1339,6 +1436,15 @@ class InventoryTerminalScreen(
                         PlatformServices.clientNetworking.sendToServer(
                             damien.nodeworks.network.CraftQueueExtractPayload(menu.containerId, slot.id, action)
                         )
+                        // Show the take at once, the next queue sync replaces the guess. The
+                        // carried stack is left to vanilla, a wrong guess there costs more
+                        // than the wait.
+                        val maxStack = getItemStack(slot.itemId, slot.componentsPatch).let { if (it.isEmpty) 64 else it.maxStackSize }
+                        val take = when (action) {
+                            2 -> maxOf(1, minOf(slot.availableCount, maxStack) / 2)
+                            else -> minOf(slot.availableCount, maxStack)
+                        }
+                        craftQueue = craftQueue.toMutableList().also { it[queueIdx] = slot.copy(availableCount = slot.availableCount - take) }
                         unfocusSearchBox()
                     }
                 }
@@ -1379,6 +1485,7 @@ class InventoryTerminalScreen(
             }
             if (menu.carried.isEmpty && entry != null && entry.info.count > 0) {
                 val action = when {
+                    hasShiftDownCompat() && button == 1 -> 7
                     hasShiftDownCompat() -> 3
                     button == 1 -> 2
                     else -> 0
@@ -1407,22 +1514,36 @@ class InventoryTerminalScreen(
         if (playerSlot != null) {
             val virtualIndex = if (playerSlot.gridType == VirtualSlot.GridType.PLAYER_MAIN) playerSlot.index else playerSlot.index + 27
             val invIndex = if (virtualIndex < 27) virtualIndex + 9 else virtualIndex - 27
-            // Double-click collect, works with item on cursor (from first click)
-            val collectItem = if (!menu.carried.isEmpty) menu.carried else (Minecraft.getInstance().player?.inventory?.getItem(invIndex) ?: ItemStack.EMPTY)
-            if (!collectItem.isEmpty) {
-                val playerItemId = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(collectItem.item)?.toString() ?: ""
-                if (checkDoubleClick(1, virtualIndex, playerItemId)) return true
+            if (!hasShiftDownCompat()) {
+                // Double-click collect, works with item on cursor (from first click)
+                val collectItem = if (!menu.carried.isEmpty) menu.carried else (Minecraft.getInstance().player?.inventory?.getItem(invIndex) ?: ItemStack.EMPTY)
+                if (!collectItem.isEmpty) {
+                    val playerItemId = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(collectItem.item)?.toString() ?: ""
+                    if (checkDoubleClick(1, virtualIndex, playerItemId)) return true
+                }
             }
             if (hasShiftDownCompat()) {
+                // Shift double-click moves every matching stack into the network,
+                // vanilla style. The first click already emptied this slot, so the
+                // server matches on the item it just took rather than the slot.
+                if (isRepeatClick(1, virtualIndex)) {
+                    PlatformServices.clientNetworking.sendToServer(
+                        InvTerminalSlotClickPayload(menu.containerId, virtualIndex, 3)
+                    )
+                    return true
+                }
                 // Shift-click: insert into network
                 PlatformServices.clientNetworking.sendToServer(
                     InvTerminalSlotClickPayload(menu.containerId, virtualIndex, 2)
                 )
-                // Start shift-drag
+                // Start shift-drag. The pressed slot is the last hovered one too, otherwise
+                // a jitter during the press re-sends a shift-click for it while the client
+                // still shows it full, and the server's sweep loses its template.
                 slotDragButton = button
                 slotDragShift = true
                 slotDragVisited.clear()
                 slotDragVisited.add(DragSlotRef(1, virtualIndex))
+                slotDragLastHovered = DragSlotRef(1, virtualIndex)
             } else if (!menu.carried.isEmpty && button == 0) {
                 // Left-click with items: start left-drag
                 slotDragButton = 0
@@ -1481,6 +1602,7 @@ class InventoryTerminalScreen(
                 if (craftSlot >= 0) {
                     val slotIdx = InventoryTerminalMenu.CRAFT_INPUT_START + craftSlot
                     val ref = DragSlotRef(0, slotIdx)
+                    if (!slotDragShift && !canDragInto(ref)) return true
                     if (shouldTriggerDragOn(ref)) {
                         if (slotDragShift) {
                             slotClicked(menu.slots[slotIdx], slotIdx, 0, net.minecraft.world.inventory.ContainerInput.QUICK_MOVE)
@@ -1499,6 +1621,7 @@ class InventoryTerminalScreen(
             if (playerSlot != null) {
                 val virtualIndex = if (playerSlot.gridType == VirtualSlot.GridType.PLAYER_MAIN) playerSlot.index else playerSlot.index + 27
                 val ref = DragSlotRef(1, virtualIndex)
+                if (!slotDragShift && !canDragInto(ref)) return true
                 if (shouldTriggerDragOn(ref)) {
                     if (slotDragShift) {
                         PlatformServices.clientNetworking.sendToServer(
@@ -1552,14 +1675,19 @@ class InventoryTerminalScreen(
                     )
                 }
             } else {
-                // Multi-slot drag, send distribute packet to server
-                val slotType = slotDragVisited.first().slotType
-                PlatformServices.clientNetworking.sendToServer(
-                    damien.nodeworks.network.InvTerminalDistributePayload(
-                        menu.containerId, slotType,
-                        slotDragVisited.map { it.index }
+                // Multi-slot drag, send distribute packet to server. The press
+                // slot stays in the visited list so a plain click still swaps,
+                // drop it here if it cannot take the carried item.
+                val targets = dragTargets()
+                if (targets.isNotEmpty()) {
+                    val slotType = targets.first().slotType
+                    PlatformServices.clientNetworking.sendToServer(
+                        damien.nodeworks.network.InvTerminalDistributePayload(
+                            menu.containerId, slotType,
+                            targets.map { it.index }
+                        )
                     )
-                )
+                }
             }
         }
         slotDragButton = -1
@@ -1579,6 +1707,10 @@ class InventoryTerminalScreen(
 
     override fun keyPressed(event: KeyEvent): Boolean {
         val keyCode = event.keyCode
+        if (channelPicker?.expanded == true && keyCode == InputConstants.KEY_ESCAPE) {
+            channelPicker?.closePopup()
+            return true
+        }
         val scanCode = event.scan
         val modifiers = event.modifierBits
         // Craft dialogue keys
@@ -1591,6 +1723,10 @@ class InventoryTerminalScreen(
             if (keyCode == InputConstants.KEY_RETURN) {
                 val count = craftDialogueField?.value?.toIntOrNull() ?: 1
                 if (count > 0) {
+                    lastAttemptItemId = craftDialogueItemId
+                    lastAttemptItemName = craftDialogueItemName
+                    lastAttemptComponentsPatch = craftDialogueComponentsPatch
+                    lastAttemptCount = count
                     PlatformServices.clientNetworking.sendToServer(
                         damien.nodeworks.network.InvTerminalCraftPayload(menu.containerId, craftDialogueItemId!!, count, craftDialogueComponentsPatch)
                     )
@@ -1728,14 +1864,30 @@ class InventoryTerminalScreen(
     /** Client-side item count at the slot referenced by [ref], used by
      *  shift-drag to skip slot-entry triggers when there's nothing to
      *  insert. Returns 0 for unknown slot types. */
-    private fun dragSlotItemCount(ref: DragSlotRef): Int = when (ref.slotType) {
-        0 -> menu.craftingContainer.getItem(ref.index - InventoryTerminalMenu.CRAFT_INPUT_START).count
+    private fun dragSlotItemCount(ref: DragSlotRef): Int = dragSlotStack(ref).count
+
+    /** Client-side stack at [ref], EMPTY for unknown slot types. */
+    private fun dragSlotStack(ref: DragSlotRef): ItemStack = when (ref.slotType) {
+        0 -> menu.craftingContainer.getItem(ref.index - InventoryTerminalMenu.CRAFT_INPUT_START)
         1 -> {
             val invIndex = if (ref.index < 27) ref.index + 9 else ref.index - 27
-            (Minecraft.getInstance().player?.inventory?.getItem(invIndex) ?: ItemStack.EMPTY).count
+            Minecraft.getInstance().player?.inventory?.getItem(invIndex) ?: ItemStack.EMPTY
         }
-        else -> 0
+        else -> ItemStack.EMPTY
     }
+
+    /** Mirrors vanilla canItemQuickReplace: a drag only paints into empty slots or
+     *  same-item slots with room. A plain click on a different item still swaps. */
+    private fun canDragInto(ref: DragSlotRef): Boolean {
+        val carried = menu.carried
+        if (carried.isEmpty) return false
+        val existing = dragSlotStack(ref)
+        if (existing.isEmpty) return true
+        return ItemStack.isSameItemSameComponents(existing, carried) && existing.count < carried.maxStackSize
+    }
+
+    /** Visited slots that can actually take the carried item. */
+    private fun dragTargets(): List<DragSlotRef> = slotDragVisited.filter { canDragInto(it) }
 
     /** Drop the search field's focus, also clearing the screen-level tracker
      *  when it was pointing here. Without the `setFocused(null)` route, vanilla's
@@ -1757,6 +1909,16 @@ class InventoryTerminalScreen(
         val row = relY / 18
         return row * 3 + col
     }
+
+    /** JEI reads the hovered slot's item and then checks that the slot's rectangle
+     *  contains the mouse, and the menu parks every real slot at -999 so vanilla
+     *  neither draws nor hit-tests them. Pointing JEI at the real slot therefore
+     *  never matched, and R and U did nothing over the crafting grid. This stand-in
+     *  sits where the slot is drawn, reads the same container slot, and carries
+     *  the real menu index so vanilla's number-key swap still targets the right
+     *  slot. [x] and [y] are absolute screen coordinates of the item. */
+    private fun jeiSlotFor(real: net.minecraft.world.inventory.Slot, x: Int, y: Int): net.minecraft.world.inventory.Slot =
+        net.minecraft.world.inventory.Slot(real.container, real.containerSlot, x - leftPos, y - topPos).also { it.index = real.index }
 
     /** Find the crafting output slot at mouse position. */
     private fun isCraftOutputAt(mx: Int, my: Int): Boolean {
@@ -1862,7 +2024,7 @@ class InventoryTerminalScreen(
      *  in the network grid. Cache key includes the patch hash so a damaged +
      *  pristine variant of the same itemId cache distinctly. */
     private fun getItemStack(itemId: String, patch: DataComponentPatch): ItemStack {
-        val cacheKey = if (patch.isEmpty) itemId else "$itemId:${patch.hashCode()}"
+        val cacheKey = DisplayStackKey(itemId, if (patch.isEmpty) DataComponentPatch.EMPTY else patch)
         return itemStackCache.getOrPut(cacheKey) {
             val id = Identifier.tryParse(itemId) ?: return@getOrPut ItemStack.EMPTY
             val item = BuiltInRegistries.ITEM.getValue(id) ?: return@getOrPut ItemStack.EMPTY
@@ -1887,5 +2049,16 @@ class InventoryTerminalScreen(
          *  `activeScreen?.menu === menu` before trusting the reference. */
         var activeScreen: InventoryTerminalScreen? = null
             private set
+
+        /** The terminal screen behind the player's open terminal menu, whether it is on
+         *  top or sits under JEI's recipe view. Sync packets for the menu go here, so a
+         *  craft that finishes or a chest that changes while JEI is open still reaches
+         *  the pinned row and the grid. Null once the menu is closed. */
+        fun liveScreen(): InventoryTerminalScreen? {
+            val mc = net.minecraft.client.Minecraft.getInstance()
+            (mc.screen as? InventoryTerminalScreen)?.let { return it }
+            val behind = activeScreen ?: return null
+            return if (behind.menu === mc.player?.containerMenu) behind else null
+        }
     }
 }

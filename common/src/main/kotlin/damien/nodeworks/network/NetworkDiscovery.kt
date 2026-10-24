@@ -48,15 +48,25 @@ object NetworkDiscovery {
         cache.clear()
     }
 
-    fun discoverNetwork(level: ServerLevel, startPos: BlockPos): NetworkSnapshot {
+    /** [maxAgeTicks] lets a caller that can live with a slightly old picture, a Transfer
+     *  Card moving items, reuse a snapshot walked up to that many ticks ago. Any change
+     *  to the network itself drops the cached entry, so the age only covers card
+     *  contents and the like. Zero, the default, means walked this tick. */
+    fun discoverNetwork(level: ServerLevel, startPos: BlockPos, maxAgeTicks: Long = 0L): NetworkSnapshot {
         val callerEntity = NodeConnectionHelper.getConnectable(level, startPos)
         val callerId = callerEntity?.networkId
         if (callerId != null) {
             val cached = cache[level.dimension() to callerId]
-            if (cached != null && cached.tick == level.gameTime) return cached.snapshot
+            if (cached != null) {
+                val age = level.gameTime - cached.tick
+                if (age in 0L..maxAgeTicks) return cached.snapshot
+            }
         }
 
-        val snapshot = doDiscoverNetwork(level, startPos)
+        val raw = doDiscoverNetwork(level, startPos)
+        // With no controller the subgraph's id is whatever propagation lent it from
+        // its anchor, which is what the caller carries.
+        val snapshot = if (raw.controller == null && callerId != null) raw.copy(anchorId = callerId) else raw
 
         // Key by the resolved controller id (stable across conflicts) so all
         // BEs on the network converge on the same cache entry regardless of
@@ -91,6 +101,9 @@ object NetworkDiscovery {
         // not once per cluster member the BFS happens to visit.
         val processingClustersSeen = mutableSetOf<BlockPos>()
         val instructionClustersSeen = mutableSetOf<BlockPos>()
+        // Ids of the micro anchors walked, so a caller can tell an id lent by one of
+        // them from a controller id that is still valid while the controller is unloaded.
+        val microAnchorIds = mutableSetOf<UUID>()
 
         queue.add(startPos to null)
         visited.add(startPos)
@@ -98,6 +111,7 @@ object NetworkDiscovery {
         while (queue.isNotEmpty()) {
             val (pos, entryFace) = queue.removeFirst()
             val connectable = NodeConnectionHelper.getConnectable(level, pos) ?: continue
+            if (connectable.isMicroNetworkAnchor()) connectable.microNetworkPermanentId?.let { microAnchorIds.add(it) }
 
             when (connectable) {
                 is NodeBlockEntity -> nodes.add(snapshotNode(connectable))
@@ -236,7 +250,10 @@ object NetworkDiscovery {
         // counter namespace as cards so the alias prefix uniquely identifies the type.
         assignAutoAliases(nodes, breakers, placers, users)
 
-        return NetworkSnapshot(nodes, crafters, variables, breakers, placers, users, cpus, processingApis, terminalPositions, controller)
+        return NetworkSnapshot(
+            nodes, crafters, variables, breakers, placers, users, cpus, processingApis, terminalPositions, controller,
+            microAnchorIds = microAnchorIds,
+        )
     }
 
     /** Assign `<base>_N` auto-aliases so every card / breaker / placer on the
@@ -409,13 +426,25 @@ data class NetworkSnapshot(
     val cpus: List<CpuSnapshot> = emptyList(),
     val processingApis: List<ProcessingApiSnapshot> = emptyList(),
     val terminalPositions: List<BlockPos> = emptyList(),
-    val controller: ControllerSnapshot? = null
+    val controller: ControllerSnapshot? = null,
+    /** Id lent by a micro or Node anchor when there is no controller. */
+    val anchorId: UUID? = null,
+    /** Micro anchors this walk visited, see [hasController]. */
+    val microAnchorIds: Set<UUID> = emptySet(),
 ) {
-    /** Whether this network has a controller and is online. */
-    val isOnline: Boolean get() = controller != null
+    /** Scripting, autocrafting and the world-acting devices need this. Storage,
+     *  terminals and item movement only need [networkId].
+     *
+     *  The walk only covers loaded chunks, so a controller it did not reach may still
+     *  be there. The id the caller carries settles it: propagation lends a Node anchor
+     *  id or a micro anchor id only when it found no controller, so an id of neither
+     *  shape came from a controller, loaded or not. */
+    val hasController: Boolean
+        get() = controller != null ||
+            (anchorId != null && !NetworkIds.isNodeAnchor(anchorId) && anchorId !in microAnchorIds)
 
-    /** The network's UUID, or null if no controller. */
-    val networkId: UUID? get() = controller?.networkId
+    /** The network's UUID: the controller's, else the anchor's, else null. */
+    val networkId: UUID? get() = controller?.networkId ?: anchorId
 
     /** All cards on this network, flattened across every node and every side.
      *  Lazy because the snapshot is shared across many lookups (especially
@@ -574,7 +603,7 @@ data class NetworkSnapshot(
         for (snapshot in processingApis) {
             for (api in snapshot.apis) {
                 for (ingr in api.outputs) {
-                    if (ingr.itemId == outputItemId && ingr.componentsHash == requestedHash) {
+                    if (!ingr.optional && ingr.itemId == outputItemId && ingr.componentsHash == requestedHash) {
                         out.add(ProcessingApiMatch(snapshot, api))
                         break
                     }

@@ -132,19 +132,26 @@ data class OpenInstructionSetPayload(val nodePos: BlockPos, val sideOrdinal: Int
     override fun type() = TYPE
 }
 
-data class SetInstructionGridPayload(val containerId: Int, val items: List<String>) : CustomPacketPayload {
+/** C2S: fill the Instruction Set grid from a recipe view (JEI). Each slot is a stack so an
+ *  ingredient that only matches with components arrives as the recipe shows it. */
+data class SetInstructionGridPayload(val containerId: Int, val items: List<net.minecraft.world.item.ItemStack>) : CustomPacketPayload {
     companion object {
         val TYPE: CustomPacketPayload.Type<SetInstructionGridPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "set_instruction_grid"))
         val CODEC: StreamCodec<FriendlyByteBuf, SetInstructionGridPayload> = CustomPacketPayload.codec(
             { p, buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
                 buf.writeVarInt(p.containerId)
-                buf.writeVarInt(p.items.size)
-                for (item in p.items) buf.writeUtf(item, 256)
+                buf.writeVarInt(p.items.size.coerceAtMost(9))
+                for (i in 0 until p.items.size.coerceAtMost(9)) {
+                    net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.encode(regBuf, p.items[i])
+                }
             },
             { buf ->
+                val regBuf = buf as net.minecraft.network.RegistryFriendlyByteBuf
                 val id = buf.readVarInt()
                 val count = buf.readVarInt()
-                val items = (0 until count).map { buf.readUtf(256) }
+                if (count > 9) throw io.netty.handler.codec.DecoderException("Instruction grid has $count slots")
+                val items = (0 until count).map { readBoundedStack(regBuf) }
                 SetInstructionGridPayload(id, items)
             }
         )
@@ -251,6 +258,55 @@ data class InvTerminalCraftGridActionPayload(val containerId: Int, val action: I
     override fun type() = TYPE
 }
 
+/** C2S: Show one channel in the Inventory Terminal grid. [channel] uses the
+ *  [damien.nodeworks.network.ChannelFilter] NBT encoding, -1 for all channels. */
+data class InvTerminalSetChannelPayload(val containerId: Int, val channel: Int) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<InvTerminalSetChannelPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "inv_terminal_set_channel"))
+        val CODEC: StreamCodec<FriendlyByteBuf, InvTerminalSetChannelPayload> = CustomPacketPayload.codec(
+            { p, buf -> buf.writeVarInt(p.containerId); buf.writeVarInt(p.channel) },
+            { buf -> InvTerminalSetChannelPayload(buf.readVarInt(), buf.readVarInt()) }
+        )
+    }
+    override fun type() = TYPE
+}
+
+/** C2S: The client's saved Inventory Terminal channel per network id, sent on join
+ *  so terminals open straight onto the saved channel. */
+data class InvTerminalChannelPrefsPayload(val entries: Map<String, Int>) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<InvTerminalChannelPrefsPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "inv_terminal_channel_prefs"))
+        val CODEC: StreamCodec<FriendlyByteBuf, InvTerminalChannelPrefsPayload> = CustomPacketPayload.codec(
+            { p, buf ->
+                val sent = p.entries.entries.take(damien.nodeworks.screen.InvTerminalChannelPrefs.MAX_ENTRIES)
+                buf.writeVarInt(sent.size)
+                for ((network, channel) in sent) { buf.writeUtf(network, 64); buf.writeVarInt(channel) }
+            },
+            { buf ->
+                val size = buf.readVarInt()
+                if (size !in 0..damien.nodeworks.screen.InvTerminalChannelPrefs.MAX_ENTRIES) throw IllegalArgumentException("Too many channel prefs: $size")
+                val entries = HashMap<String, Int>(size)
+                repeat(size) { entries[buf.readUtf(64)] = buf.readVarInt() }
+                InvTerminalChannelPrefsPayload(entries)
+            }
+        )
+    }
+    override fun type() = TYPE
+}
+
+/** S2C: The network an Inventory Terminal menu is on, so the client can restore the
+ *  channel it saved for that network. [networkId] is empty when there is none. */
+data class InvTerminalNetworkPayload(val containerId: Int, val networkId: String) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<InvTerminalNetworkPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "inv_terminal_network"))
+        val CODEC: StreamCodec<FriendlyByteBuf, InvTerminalNetworkPayload> = CustomPacketPayload.codec(
+            { p, buf -> buf.writeVarInt(p.containerId); buf.writeUtf(p.networkId) },
+            { buf -> InvTerminalNetworkPayload(buf.readVarInt(), buf.readUtf(64)) }
+        )
+    }
+    override fun type() = TYPE
+}
+
 /**
  * C2S: Distribute carried item evenly across specified crafting slot indices.
  * Used for left-click drag in the crafting grid.
@@ -334,6 +390,13 @@ data class InvTerminalSlotClickPayload(val containerId: Int, val slotIndex: Int,
             { buf -> InvTerminalSlotClickPayload(buf.readVarInt(), buf.readVarInt(), buf.readVarInt()) }
         )
     }
+    override fun type() = TYPE
+}
+
+/** C2S: Open the first Portable Inventory Terminal in the player inventory (hotkey). */
+data object OpenPortableTerminalPayload : CustomPacketPayload {
+    val TYPE: CustomPacketPayload.Type<OpenPortableTerminalPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "open_portable_terminal"))
+    val CODEC: StreamCodec<FriendlyByteBuf, OpenPortableTerminalPayload> = StreamCodec.unit(this)
     override fun type() = TYPE
 }
 
@@ -421,9 +484,38 @@ data class SetProcessingApiNamePayload(val containerId: Int, val name: String) :
     override fun type() = TYPE
 }
 
+/** C2S: Set the tag a Processing Set input slot accepts, empty to clear. Sent by the JEI
+ *  recipe transfer after the slot's item, so the item is in place when the server checks
+ *  that it is a member. */
+data class SetProcessingApiSlotTagPayload(val containerId: Int, val slotIndex: Int, val tagId: String) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<SetProcessingApiSlotTagPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "set_processing_api_slot_tag"))
+        val CODEC: StreamCodec<FriendlyByteBuf, SetProcessingApiSlotTagPayload> = CustomPacketPayload.codec(
+            { p, buf -> buf.writeVarInt(p.containerId); buf.writeVarInt(p.slotIndex); buf.writeUtf(p.tagId, 256) },
+            { buf -> SetProcessingApiSlotTagPayload(buf.readVarInt(), buf.readVarInt(), buf.readUtf(256)) }
+        )
+    }
+    override fun type() = TYPE
+}
+
+/** C2S: a click on a Processing Set editor cell. [index] is a backing index on the input
+ *  or output grid, mapped through the client's scroll window, so the server never needs
+ *  the window. [button] is 0 or 1. The server applies the editor's one placement rule
+ *  against its own carried stack. */
+data class ProcessingSetGhostClickPayload(val containerId: Int, val index: Int, val isOutput: Boolean, val button: Int) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<ProcessingSetGhostClickPayload> = CustomPacketPayload.Type(Identifier.fromNamespaceAndPath("nodeworks", "processing_set_ghost_click"))
+        val CODEC: StreamCodec<FriendlyByteBuf, ProcessingSetGhostClickPayload> = CustomPacketPayload.codec(
+            { p, buf -> buf.writeVarInt(p.containerId); buf.writeVarInt(p.index); buf.writeBoolean(p.isOutput); buf.writeVarInt(p.button) },
+            { buf -> ProcessingSetGhostClickPayload(buf.readVarInt(), buf.readVarInt(), buf.readBoolean(), buf.readVarInt()) }
+        )
+    }
+    override fun type() = TYPE
+}
+
 /**
  * C2S: Set a single ghost slot on the Processing Set by item ID.
- * slotIndex 0-8 = input, 9-11 = output. Empty string = clear slot.
+ * slotIndex 0 to 26 = input, 27 to 35 = output, backing indices. Empty string = clear slot.
  */
 /**
  * C2S: Set a Processing Set editor ghost slot to [stack].
@@ -1151,6 +1243,63 @@ data class ProcessingHandlerStateSyncPayload(val data: damien.nodeworks.screen.P
     override fun type() = TYPE
 }
 
+/** C2S: bind or unbind one Processing Set on a Multi-Processing Handler. The server
+ *  checks the set is on the parent network, free, and under the cap. */
+data class MultiProcessingHandlerTogglePayload(val pos: BlockPos, val processingApiName: String, val selected: Boolean) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<MultiProcessingHandlerTogglePayload> = CustomPacketPayload.Type(
+            Identifier.fromNamespaceAndPath("nodeworks", "mphandler_toggle")
+        )
+        val CODEC: StreamCodec<FriendlyByteBuf, MultiProcessingHandlerTogglePayload> = CustomPacketPayload.codec(
+            { p, buf -> buf.writeBlockPos(p.pos); buf.writeUtf(p.processingApiName, 4096); buf.writeBoolean(p.selected) },
+            { buf -> MultiProcessingHandlerTogglePayload(buf.readBlockPos(), buf.readUtf(4096), buf.readBoolean()) }
+        )
+    }
+    override fun type() = TYPE
+}
+
+/** C2S: set the Multi-Processing Handler's input channel, or its output channel when [output]. */
+data class MultiProcessingHandlerSetChannelPayload(val pos: BlockPos, val output: Boolean, val channelId: Int) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<MultiProcessingHandlerSetChannelPayload> = CustomPacketPayload.Type(
+            Identifier.fromNamespaceAndPath("nodeworks", "mphandler_set_channel")
+        )
+        val CODEC: StreamCodec<FriendlyByteBuf, MultiProcessingHandlerSetChannelPayload> = CustomPacketPayload.codec(
+            { p, buf -> buf.writeBlockPos(p.pos); buf.writeBoolean(p.output); buf.writeVarInt(p.channelId) },
+            { buf -> MultiProcessingHandlerSetChannelPayload(buf.readBlockPos(), buf.readBoolean(), buf.readVarInt()) }
+        )
+    }
+    override fun type() = TYPE
+}
+
+/** C2S: let several recipes run through a Multi-Processing Handler at once, or one at a time. */
+data class MultiProcessingHandlerSetParallelPayload(val pos: BlockPos, val enabled: Boolean) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<MultiProcessingHandlerSetParallelPayload> = CustomPacketPayload.Type(
+            Identifier.fromNamespaceAndPath("nodeworks", "mphandler_set_parallel")
+        )
+        val CODEC: StreamCodec<FriendlyByteBuf, MultiProcessingHandlerSetParallelPayload> = CustomPacketPayload.codec(
+            { p, buf -> buf.writeBlockPos(p.pos); buf.writeBoolean(p.enabled) },
+            { buf -> MultiProcessingHandlerSetParallelPayload(buf.readBlockPos(), buf.readBoolean()) }
+        )
+    }
+    override fun type() = TYPE
+}
+
+/** S2C: refresh the open Multi-Processing Handler menu after a change. */
+data class MultiProcessingHandlerStateSyncPayload(val data: damien.nodeworks.screen.MultiProcessingHandlerOpenData) : CustomPacketPayload {
+    companion object {
+        val TYPE: CustomPacketPayload.Type<MultiProcessingHandlerStateSyncPayload> = CustomPacketPayload.Type(
+            Identifier.fromNamespaceAndPath("nodeworks", "mphandler_state_sync")
+        )
+        val CODEC: StreamCodec<FriendlyByteBuf, MultiProcessingHandlerStateSyncPayload> = CustomPacketPayload.codec(
+            { p, buf -> damien.nodeworks.screen.MultiProcessingHandlerOpenData.STREAM_CODEC.encode(buf, p.data) },
+            { buf -> MultiProcessingHandlerStateSyncPayload(damien.nodeworks.screen.MultiProcessingHandlerOpenData.STREAM_CODEC.decode(buf)) }
+        )
+    }
+    override fun type() = TYPE
+}
+
 /**
  * S2C: assign one network id to many Connectable BEs in one packet, for
  * `propagateNetworkId` to push the result of a graph walk to clients without
@@ -1235,16 +1384,16 @@ data class DiagnosticProcessingApisChunkPayload(
             },
             { buf ->
                 val isLast = buf.readBoolean()
-                val count = buf.readVarInt()
+                val count = buf.readVarInt().coerceIn(0, 256)
                 val apis = (0 until count).map {
                     val name = buf.readUtf(64)
-                    val inCount = buf.readVarInt()
+                    val inCount = buf.readVarInt().coerceIn(0, 64)
                     val inputs = (0 until inCount).map {
                         val stack = net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.decode(buf)
                         val cnt = buf.readVarInt()
                         damien.nodeworks.script.RecipeIngredient(stack, cnt)
                     }
-                    val outCount = buf.readVarInt()
+                    val outCount = buf.readVarInt().coerceIn(0, 64)
                     val outputs = (0 until outCount).map {
                         val stack = net.minecraft.world.item.ItemStack.OPTIONAL_STREAM_CODEC.decode(buf)
                         val cnt = buf.readVarInt()
