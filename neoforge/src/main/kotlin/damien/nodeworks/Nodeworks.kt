@@ -683,6 +683,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                             menu.markDirty()
                         }
                         "optional" -> menu.setOutputOptional(payload.slotIndex, payload.value != 0)
+                        "clear" -> menu.clearAll()
                     }
                 }
             }
@@ -935,6 +936,21 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
             }
         }
 
+        registrar.playToServer(
+            damien.nodeworks.network.ProcessingSetGhostClickPayload.TYPE,
+            damien.nodeworks.network.ProcessingSetGhostClickPayload.CODEC,
+        ) { payload, context ->
+            context.enqueueWork {
+                val player = context.player()
+                val menu = player.containerMenu
+                if (menu is damien.nodeworks.screen.ProcessingSetScreenHandler && menu.containerId == payload.containerId &&
+                    (payload.button == 0 || payload.button == 1)
+                ) {
+                    menu.applyGhostClick(payload.index, payload.isOutput, payload.button == 1)
+                }
+            }
+        }
+
         registrar.playToServer(SetProcessingApiSlotPayload.TYPE, SetProcessingApiSlotPayload.CODEC) { payload, context ->
             context.enqueueWork {
                 val player = context.player()
@@ -1009,10 +1025,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
         }
         registrar.playToClient(InventorySyncPayload.TYPE, InventorySyncPayload.CODEC) { payload, context ->
             context.enqueueWork {
-                val screen = net.minecraft.client.Minecraft.getInstance().screen
-                if (screen is damien.nodeworks.screen.InventoryTerminalScreen) {
-                    screen.repo.handleUpdate(payload)
-                }
+                damien.nodeworks.screen.InventoryTerminalScreen.liveScreen()?.repo?.handleUpdate(payload)
             }
         }
         registrar.playToClient(BufferSyncPayload.TYPE, BufferSyncPayload.CODEC) { payload, context ->
@@ -1037,10 +1050,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 
         registrar.playToClient(CraftRequestErrorPayload.TYPE, CraftRequestErrorPayload.CODEC) { payload, context ->
             context.enqueueWork {
-                val screen = net.minecraft.client.Minecraft.getInstance().screen
-                if (screen is damien.nodeworks.screen.InventoryTerminalScreen) {
-                    screen.setCraftError(payload.message)
-                }
+                damien.nodeworks.screen.InventoryTerminalScreen.liveScreen()?.setCraftError(payload.message)
             }
         }
 
@@ -1050,7 +1060,7 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
                 val menu = player.containerMenu
                 if (menu is damien.nodeworks.screen.InventoryTerminalMenu && menu.containerId == payload.containerId) {
                     menu.networkId = runCatching { java.util.UUID.fromString(payload.networkId) }.getOrNull()
-                    (net.minecraft.client.Minecraft.getInstance().screen as? damien.nodeworks.screen.InventoryTerminalScreen)?.onNetworkSynced()
+                    damien.nodeworks.screen.InventoryTerminalScreen.liveScreen()?.onNetworkSynced()
                 }
             }
         }
@@ -1104,10 +1114,8 @@ class Nodeworks(modBus: IEventBus, container: ModContainer) {
 
         registrar.playToClient(CraftQueueSyncPayload.TYPE, CraftQueueSyncPayload.CODEC) { payload, context ->
             context.enqueueWork {
-                val screen = net.minecraft.client.Minecraft.getInstance().screen
-                if (screen is damien.nodeworks.screen.InventoryTerminalScreen) {
-                    screen.handleQueueSync(payload)
-                }
+                val screen = damien.nodeworks.screen.InventoryTerminalScreen.liveScreen() ?: return@enqueueWork
+                if (screen.menu.containerId == payload.containerId) screen.handleQueueSync(payload)
             }
         }
 

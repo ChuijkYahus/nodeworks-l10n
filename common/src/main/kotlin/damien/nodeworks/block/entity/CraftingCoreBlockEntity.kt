@@ -85,6 +85,8 @@ class CraftingCoreBlockEntity(
     val scheduler: CraftScheduler = CraftScheduler(threadCount = 1, executor = opExecutor)
 
     companion object {
+        /** How often an idle CPU tries to move leftover buffer contents to storage. */
+        private const val IDLE_DRAIN_TICKS = 20L
         private var pushDepth = 0
 
         /** True while a Core writes formed and overheat blockstates into its structure.
@@ -162,6 +164,11 @@ class CraftingCoreBlockEntity(
      * is idle, otherwise queues. [onComplete] fires exactly once when the plan
      * reaches DONE (true) or FAILED (false). Safe to call from any server-side context.
      */
+    /** Told the running total of root items delivered ahead of the plan's end. */
+    fun registerProgressListener(plan: CraftPlan, onProgress: (Long) -> Unit) {
+        opExecutor.registerProgressListener(plan, onProgress)
+    }
+
     fun submitCraft(plan: CraftPlan, currentTick: Long, onComplete: ((Boolean) -> Unit)? = null) {
         // Stale per-op state is wiped by [clearOpState] when the plan actually starts, so a
         // plan queued behind a running one never touches the running plan's state.
@@ -189,6 +196,33 @@ class CraftingCoreBlockEntity(
             recalculateCapacity()
         }
         scheduler.tick(level.gameTime)
+        if (level.gameTime % IDLE_DRAIN_TICKS == 0L) drainIdleBuffer(level)
+    }
+
+    /** Items in the buffer with no plan left to deliver them, a job's over-capacity holds
+     *  after its plan ended, a sweep that lost its room, go to network storage once a
+     *  second while the CPU is idle, so nothing sits in an idle buffer longer than storage
+     *  is full. A plan running or queued, a resumed one included, and a scripted craft
+     *  waiting for its callback still own their buffer and are left alone. */
+    private fun drainIdleBuffer(level: ServerLevel) {
+        if (isCrafting || !scheduler.isIdle || scheduler.queuedPlans.isNotEmpty() || drivenBy != null) return
+        if (bufferState.count <= 0L) return
+        val snap = damien.nodeworks.network.NetworkDiscovery.discoverNetwork(level, worldPosition)
+        var moved = false
+        for ((key, entry) in bufferState.contents()) {
+            var left = entry.count
+            while (left > 0L) {
+                val n = minOf(left, entry.template.maxStackSize.toLong()).toInt()
+                val inserted = damien.nodeworks.script.NetworkStorageHelper.insertItemStack(level, snap, entry.template.copyWithCount(n), null)
+                if (inserted <= 0) break
+                removeFromBuffer(key, inserted.toLong())
+                left -= inserted
+                moved = true
+            }
+        }
+        if (!moved) return
+        if (bufferState.count <= 0L && lastFailureReason.startsWith("Buffer over capacity")) lastFailureReason = ""
+        setChanged()
     }
 
     /** Re-register terminal craft-queue rows for plans restored from NBT.
@@ -212,13 +246,19 @@ class CraftingCoreBlockEntity(
                     ?: plan.rootItemId,
                 plan.rootCount.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
             )
-            opExecutor.registerCompletionListener(plan) { success ->
-                if (success) {
-                    entry.completedOps = 1
-                } else {
-                    damien.nodeworks.screen.CraftQueueManager.getQueue(submitter).remove(entry)
-                }
+            // What trickled out before the reload is still the player's.
+            val delivered = plan.ops.firstOrNull { it is damien.nodeworks.script.cpu.Operation.Deliver && it.id in plan.terminalOpIds }
+                ?.let { (it as damien.nodeworks.script.cpu.Operation.Deliver).delivered } ?: 0L
+            if (delivered > 0L) {
+                entry.deliveredCount = delivered.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
                 entry.dirty = true
+            }
+            opExecutor.registerProgressListener(plan) { total ->
+                entry.deliveredCount = total.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                entry.dirty = true
+            }
+            opExecutor.registerCompletionListener(plan) { success ->
+                damien.nodeworks.screen.CraftQueueManager.finishEntry(submitter, entry, success)
             }
         }
     }

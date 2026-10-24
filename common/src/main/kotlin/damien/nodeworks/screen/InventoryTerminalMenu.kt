@@ -127,9 +127,11 @@ class InventoryTerminalMenu(
 
     // Crafting grid
     var autoPull: Boolean = false
-    // Template of the stack the last shift-click moved into the network. A shift
-    // double-click sweeps everything matching it, the clicked slot is already empty.
+    // Template of the stack the last shift-click moved into the network and the slot it
+    // came from. A shift double-click on that slot sweeps everything matching it, the
+    // slot itself is already empty by then.
     private var lastShiftInserted: ItemStack = ItemStack.EMPTY
+    private var lastShiftInsertedSlot: Int = -1
     private var autoPullPattern: List<ItemStack>? = null  // captured right before craft output is taken
     private var suppressSlotsChanged = false
 
@@ -1329,10 +1331,13 @@ class InventoryTerminalMenu(
                 }
             }
             2 -> { // Shift-click, crystal → crystal slot (Handheld), else network
-                // Reset so a shift double-click on an empty slot sweeps nothing.
-                lastShiftInserted = ItemStack.EMPTY
                 val slotStack = playerInventory.getItem(invIndex)
+                // An empty slot leaves the template alone. While its view lags the client
+                // can shift-click the slot it still shows full a second time, and the
+                // sweep that follows must still know what the first click moved.
                 if (!slotStack.isEmpty) {
+                    lastShiftInserted = ItemStack.EMPTY
+                    lastShiftInsertedSlot = -1
                     val cContainer = crystalContainer
                     // Handheld shortcut: if the player shift-clicks a Link Crystal
                     // and the crystal slot is empty, route it there rather than
@@ -1350,6 +1355,7 @@ class InventoryTerminalMenu(
                         val snap = snapshot
                         if (lvl != null && snap != null) {
                             lastShiftInserted = slotStack.copyWithCount(1)
+                            lastShiftInsertedSlot = slotIndex
                             val inserted = NetworkStorageHelper.insertItemStack(lvl, snap, slotStack, cache, channel = channel)
                             if (inserted > 0) {
                                 slotStack.shrink(inserted)
@@ -1363,7 +1369,9 @@ class InventoryTerminalMenu(
                 val template = lastShiftInserted
                 val lvl = serverLevel
                 val snap = snapshot
-                if (!template.isEmpty && lvl != null && snap != null) {
+                // Only the slot the template came from sweeps, so a double-click on some
+                // other empty slot moves nothing.
+                if (!template.isEmpty && slotIndex == lastShiftInsertedSlot && lvl != null && snap != null) {
                     for (i in 0 until 36) {
                         if (isHeldPortableInvSlot(i)) continue
                         val stack = playerInventory.getItem(i)
@@ -1507,6 +1515,9 @@ class InventoryTerminalMenu(
          *  cell doesn't accidentally pull a Fire Resistance one out of the
          *  same itemId bucket. */
         componentsPatch: net.minecraft.core.component.DataComponentPatch? = null,
+        /** Settle this player's craft reservations against the new stock, see below. The
+         *  pinned-row pickup passes false, it accounts for its own take. */
+        settle: Boolean = true,
     ): List<ItemStack> {
         if (maxCount <= 0L) return emptyList()
         val wantHash = componentsPatch?.let { damien.nodeworks.script.BufferKey.componentsHash(it) }
@@ -1556,6 +1567,12 @@ class InventoryTerminalMenu(
                 }
             }
             if (!leftover.isEmpty) merged.add(leftover)
+        }
+        // The player took these through their own terminal, so a reservation the network
+        // can no longer cover is theirs to give up, now rather than after a poll cycle.
+        if (settle && out.isNotEmpty()) {
+            val cc = c ?: cache
+            if (cc != null) CraftQueueManager.settle(snap.networkId, { key -> cc.variantCount(key) }, cc.completedCycles, actor = playerInventory.player.uuid)
         }
         return merged
     }
@@ -1974,7 +1991,17 @@ class InventoryTerminalMenu(
                 componentsPatch = componentsPatch,
             )
             val pending = damien.nodeworks.script.CraftingHelper.currentPendingJob
+            val plan = damien.nodeworks.script.CraftingHelper.currentPlan
             damien.nodeworks.script.CraftingHelper.currentPendingJob = null
+            damien.nodeworks.script.CraftingHelper.currentPlan = null
+            // Items the CPU hands over early show on the pinned row as they land. The
+            // listener holds the entry, not this menu, so it outlives the screen.
+            if (plan != null) {
+                result?.cpu?.registerProgressListener(plan) { delivered ->
+                    entry.deliveredCount = delivered.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                    entry.dirty = true
+                }
+            }
 
             if (result == null && pending == null) {
                 // Total failure, no feasible CPU, missing recipe, etc.
@@ -2008,23 +2035,12 @@ class InventoryTerminalMenu(
             if (pending == null || pending.isComplete) {
                 // Synchronous, release immediately (flush buffer → network, free CPU)
                 damien.nodeworks.script.CraftingHelper.releaseCraftResult(craftResult)
-                if (pending == null || pending.success) {
-                    entry.completedOps = 1
-                } else {
-                    CraftQueueManager.getQueue(player.uuid).remove(entry)
-                }
-                entry.dirty = true
+                CraftQueueManager.finishEntry(player.uuid, entry, pending == null || pending.success)
             } else {
                 // Async, release when the pending job completes (same as :store())
                 pending.onCompleteCallback = { success ->
                     damien.nodeworks.script.CraftingHelper.releaseCraftResult(craftResult)
-                    if (success) {
-                        entry.completedOps = 1
-                    } else {
-                        // Cancelled or failed, drop the entry so nothing can be extracted
-                        CraftQueueManager.getQueue(player.uuid).remove(entry)
-                    }
-                    entry.dirty = true
+                    CraftQueueManager.finishEntry(player.uuid, entry, success)
                     needsImmediateSync = true
                 }
             }
@@ -2123,6 +2139,9 @@ class InventoryTerminalMenu(
      * action: 0=extract to cursor, 1=shift to inventory, 2=extract half
      */
     fun handleQueueExtract(player: Player, entryId: Int, action: Int) {
+        // The screen already lowered its count for this click. Whatever happens below,
+        // the next tick sends the real row, a successful pickup sends it sooner.
+        CraftQueueManager.markSyncPending(player.uuid)
         val lvl = serverLevel ?: return
         val snap = snapshot ?: return
         val queue = CraftQueueManager.getQueue(player.uuid)
@@ -2144,7 +2163,7 @@ class InventoryTerminalMenu(
 
         // Only the crafted variant, never another one already in storage.
         val variant = entry.componentsPatch.takeIf { it.size() > 0 }
-        val stacks = extractRealStacks(lvl, snap, cache, entry.itemId, toExtract, variant)
+        val stacks = extractRealStacks(lvl, snap, cache, entry.itemId, toExtract, variant, settle = false)
         if (stacks.isNotEmpty()) {
             val totalExtracted = stacks.sumOf { it.count }
             entry.takenCount += totalExtracted
@@ -2245,9 +2264,13 @@ class InventoryTerminalMenu(
         // Without this, opening a portable terminal on Network A would show jobs queued
         // on Network B in the pinned row and incorrectly deduct items B reserved.
         val networkId = snapshot?.networkId
+        val c = cache
+        // Reservations follow the stock. Items a finished craft set aside may already
+        // have left storage through the crafting grid or anyone else, and the pinned
+        // row must not offer them.
+        if (c != null) CraftQueueManager.settle(networkId, { key -> c.variantCount(key) }, c.completedCycles)
         val queue = CraftQueueManager.getQueueForNetwork(serverPlayer.uuid, networkId)
         val reserved = CraftQueueManager.getReservedCounts(serverPlayer.uuid, networkId)
-        val c = cache
 
         if (needsFullSync) {
             // Build all entries (items + fluids) and split into chunks. When we're
@@ -2325,7 +2348,7 @@ class InventoryTerminalMenu(
         needsImmediateSync = false
 
         // Send queue updates if any entries are dirty
-        val queueDirty = queue.any { it.dirty }
+        val queueDirty = CraftQueueManager.hasSyncPending(serverPlayer.uuid) || queue.any { it.dirty }
         if (queueDirty) {
             sendQueueSync(serverPlayer, queue)
         }
@@ -2453,15 +2476,15 @@ class InventoryTerminalMenu(
 
     private fun sendQueueSync(player: ServerPlayer, queue: List<CraftQueueManager.CraftQueueEntry>) {
         val entries = queue.map { e ->
-            val readyCount = if (e.isComplete) e.totalRequested else 0
             damien.nodeworks.network.CraftQueueSyncPayload.QueueEntry(
                 id = e.id, itemId = e.itemId, name = e.itemName,
-                totalRequested = e.totalRequested, readyCount = readyCount,
+                totalRequested = e.totalRequested, readyCount = e.readyCount,
                 availableCount = e.availableCount, isComplete = e.isComplete,
                 componentsPatch = e.componentsPatch,
             )
         }
         for (e in queue) e.dirty = false
+        CraftQueueManager.clearSyncPending(player.uuid)
         player.connection.send(
             net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket(
                 damien.nodeworks.network.CraftQueueSyncPayload(containerId, entries)
